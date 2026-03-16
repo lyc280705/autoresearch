@@ -31,3 +31,11 @@ data/
 
 # uv lock file (regenerated)
 uv.lock
+
+# YOLO training artifacts
+runs/
+*.pt
+!yolov8*.pt
+
+# Conda
+.conda/

@@ -1,27 +1,22 @@
 """
-Autoresearch garbage classification training script.
-Single-GPU (CUDA or MPS), single-file.
+Autoresearch garbage OBJECT DETECTION training script.
+Uses YOLOv8 to detect and classify multiple garbage objects in each image.
 
-Baseline: MobileNetV2 with transfer learning for 4-category
-Chinese garbage classification (可回收物/有害垃圾/厨余垃圾/其他垃圾).
+Supports: CUDA (NVIDIA GPU), MPS (Apple Silicon M4 Pro), CPU.
+Usage: python train.py
 
-Usage: uv run train.py
+The agent edits THIS file to optimize detection performance.
 """
 
 import os
-import gc
-import math
 import time
-from dataclasses import dataclass, asdict
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import models
+from ultralytics import YOLO
 
 from prepare import (
     IMAGE_SIZE, TIME_BUDGET, NUM_CLASSES, CLASS_NAMES, CLASS_NAMES_EN,
-    make_dataloader, evaluate,
+    DATA_DIR, evaluate, get_data_yaml_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -31,324 +26,169 @@ from prepare import (
 def get_device():
     """Auto-detect best available device: CUDA > MPS > CPU."""
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        return "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
+        return "mps"
     else:
-        return torch.device("cpu")
+        return "cpu"
 
 # ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-
-class GarbageClassifier(nn.Module):
-    """
-    MobileNetV2-based garbage classifier with custom head.
-
-    Architecture:
-      - MobileNetV2 backbone (pretrained on ImageNet)
-      - Global Average Pooling
-      - Dropout → FC → ReLU → Dropout → FC (num_classes)
-
-    The backbone is partially frozen: only the last few layers are fine-tuned
-    along with the custom classification head.
-    """
-
-    def __init__(self, num_classes=NUM_CLASSES, dropout=0.3, freeze_backbone_ratio=0.7):
-        super().__init__()
-        self.num_classes = num_classes
-
-        # Load pretrained MobileNetV2
-        self.backbone = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
-        backbone_out_features = self.backbone.classifier[1].in_features
-
-        # Freeze early layers of backbone
-        all_params = list(self.backbone.features.parameters())
-        n_freeze = int(len(all_params) * freeze_backbone_ratio)
-        for param in all_params[:n_freeze]:
-            param.requires_grad = False
-
-        # Replace classifier head
-        self.backbone.classifier = nn.Identity()
-        self.classifier = nn.Sequential(
-            nn.Dropout(p=dropout),
-            nn.Linear(backbone_out_features, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=dropout * 0.5),
-            nn.Linear(256, num_classes),
-        )
-
-    def forward(self, x):
-        features = self.backbone(x)
-        logits = self.classifier(features)
-        return logits
-
-    def get_param_groups(self, backbone_lr, head_lr, weight_decay=0.01):
-        """Return parameter groups with different learning rates."""
-        backbone_params = [p for p in self.backbone.parameters() if p.requires_grad]
-        head_params = list(self.classifier.parameters())
-
-        return [
-            {"params": backbone_params, "lr": backbone_lr, "weight_decay": weight_decay},
-            {"params": head_params, "lr": head_lr, "weight_decay": weight_decay * 0.1},
-        ]
-
-
-# ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
+# Hyperparameters (edit these to optimize — this is the main lever)
 # ---------------------------------------------------------------------------
 
 # Model
-DROPOUT = 0.3                  # dropout rate in classifier head
-FREEZE_BACKBONE_RATIO = 0.7    # fraction of backbone layers to freeze
+MODEL_SIZE = "yolov8s.pt"     # Options: yolov8n/s/m/l/x (.pt)
+FREEZE_LAYERS = 0             # Number of backbone layers to freeze (0 = none)
 
-# Optimization
-BACKBONE_LR = 1e-4             # learning rate for backbone (fine-tuning)
-HEAD_LR = 1e-3                 # learning rate for classifier head
-WEIGHT_DECAY = 0.01            # L2 regularization
-BATCH_SIZE = 32                # training batch size
-LABEL_SMOOTHING = 0.1          # label smoothing for cross-entropy
+# Training
+BATCH_SIZE = 16               # batch size (adjust for VRAM)
+LR0 = 0.01                   # initial learning rate
+LRF = 0.01                   # final LR as fraction of LR0
+MOMENTUM = 0.937              # SGD momentum / Adam beta1
+WEIGHT_DECAY = 0.0005         # L2 regularization
+WARMUP_EPOCHS = 3.0           # warmup epochs
+WARMUP_MOMENTUM = 0.8         # warmup initial momentum
 
-# Schedule
-WARMUP_RATIO = 0.1             # fraction of steps for LR warmup
-USE_COSINE_SCHEDULE = True     # use cosine annealing (vs. step decay)
+# Loss weights
+BOX_LOSS_GAIN = 7.5           # box loss weight
+CLS_LOSS_GAIN = 0.5           # classification loss weight
+DFL_LOSS_GAIN = 1.5           # distribution focal loss weight
 
-# Data
-IMAGE_INPUT_SIZE = IMAGE_SIZE  # input image resolution (from prepare.py)
-NUM_WORKERS = 4                # data loading workers
-BALANCED_SAMPLING = True       # use weighted sampling for class imbalance
+# Data augmentation
+HSV_H = 0.015                 # HSV-Hue augmentation range
+HSV_S = 0.7                   # HSV-Saturation augmentation range
+HSV_V = 0.4                   # HSV-Value augmentation range
+DEGREES = 0.0                 # rotation augmentation (degrees)
+TRANSLATE = 0.1               # translation augmentation (fraction)
+SCALE = 0.5                   # scale augmentation (fraction)
+SHEAR = 0.0                   # shear augmentation (degrees)
+PERSPECTIVE = 0.0             # perspective augmentation
+FLIPUD = 0.0                  # vertical flip probability
+FLIPLR = 0.5                  # horizontal flip probability
+MOSAIC = 1.0                  # mosaic augmentation probability
+MIXUP = 0.0                   # mixup augmentation probability
+COPY_PASTE = 0.0              # copy-paste augmentation probability
+
+# Inference
+CONF_THRESHOLD = 0.25         # confidence threshold for predictions
+IOU_THRESHOLD = 0.7           # NMS IoU threshold
 
 # ---------------------------------------------------------------------------
-# Setup: device, model, optimizer, dataloader
+# Setup
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
 torch.manual_seed(42)
 device = get_device()
 print(f"Device: {device}")
+print(f"Model:  {MODEL_SIZE}")
 
-if device.type == "cuda":
-    torch.cuda.manual_seed(42)
-    torch.set_float32_matmul_precision("high")
-
-# Determine number of classes from actual data
-train_loader, train_dataset = make_dataloader(
-    "train", BATCH_SIZE, IMAGE_INPUT_SIZE,
-    num_workers=NUM_WORKERS, balanced_sampling=BALANCED_SAMPLING,
-)
-val_loader, val_dataset = make_dataloader(
-    "val", BATCH_SIZE, IMAGE_INPUT_SIZE,
-    num_workers=NUM_WORKERS, balanced_sampling=False,
+# Load data config
+data_yaml = get_data_yaml_path()
+assert os.path.exists(data_yaml), (
+    f"Data config not found: {data_yaml}. Run `python prepare.py` first."
 )
 
-actual_num_classes = len(train_dataset.class_to_idx)
-print(f"Number of classes: {actual_num_classes}")
-print(f"Classes: {train_dataset.classes}")
-print(f"Training samples: {len(train_dataset)}")
-print(f"Validation samples: {len(val_dataset)}")
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
 
-# Class distribution
-class_counts = {}
-for cls_name, cls_idx in train_dataset.class_to_idx.items():
-    count = (train_dataset.targets == cls_idx).sum()
-    class_counts[cls_name] = int(count)
-    print(f"  {cls_name}: {count} images")
+# Load pretrained YOLO model
+model = YOLO(MODEL_SIZE)
 
-# Build model
-model = GarbageClassifier(
-    num_classes=actual_num_classes,
-    dropout=DROPOUT,
-    freeze_backbone_ratio=FREEZE_BACKBONE_RATIO,
+# Train with time budget (YOLO 'time' parameter uses hours)
+results = model.train(
+    data=data_yaml,
+    epochs=200,                        # max epochs (time budget will stop earlier)
+    time=TIME_BUDGET / 3600,           # time limit in hours (5 min = 0.0833h)
+    imgsz=IMAGE_SIZE,
+    batch=BATCH_SIZE,
+    device=device,
+
+    # Optimizer
+    lr0=LR0,
+    lrf=LRF,
+    momentum=MOMENTUM,
+    weight_decay=WEIGHT_DECAY,
+    warmup_epochs=WARMUP_EPOCHS,
+    warmup_momentum=WARMUP_MOMENTUM,
+
+    # Loss
+    box=BOX_LOSS_GAIN,
+    cls=CLS_LOSS_GAIN,
+    dfl=DFL_LOSS_GAIN,
+
+    # Augmentation
+    hsv_h=HSV_H,
+    hsv_s=HSV_S,
+    hsv_v=HSV_V,
+    degrees=DEGREES,
+    translate=TRANSLATE,
+    scale=SCALE,
+    shear=SHEAR,
+    perspective=PERSPECTIVE,
+    flipud=FLIPUD,
+    fliplr=FLIPLR,
+    mosaic=MOSAIC,
+    mixup=MIXUP,
+    copy_paste=COPY_PASTE,
+
+    # Freeze backbone layers
+    freeze=FREEZE_LAYERS if FREEZE_LAYERS > 0 else None,
+
+    # Output
+    patience=0,                        # disable early stopping (use time budget)
+    save=True,
+    save_period=-1,                    # save only best and last
+    project="runs",
+    name="train",
+    exist_ok=True,
+    verbose=True,
+    seed=42,
 )
-model = model.to(device)
-
-num_params = sum(p.numel() for p in model.parameters())
-num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Total parameters: {num_params:,}")
-print(f"Trainable parameters: {num_trainable:,}")
-
-# Optimizer
-param_groups = model.get_param_groups(BACKBONE_LR, HEAD_LR, WEIGHT_DECAY)
-optimizer = torch.optim.AdamW(param_groups)
-
-# Loss function with class weights and label smoothing
-class_weights = train_dataset.get_class_weights().to(device)
-print(f"Class weights: {class_weights.tolist()}")
-criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
-
-# Mixed precision
-use_amp = device.type in ("cuda", "mps")
-if device.type == "cuda":
-    scaler = torch.amp.GradScaler("cuda")
-else:
-    scaler = None
-
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Batch size: {BATCH_SIZE}")
-print(f"Mixed precision: {use_amp}")
 
 # ---------------------------------------------------------------------------
-# Learning rate schedule
+# Evaluation
 # ---------------------------------------------------------------------------
 
-def get_lr_multiplier(progress, warmup_ratio=WARMUP_RATIO):
-    """Warmup + cosine/linear decay schedule."""
-    if progress < warmup_ratio:
-        return progress / warmup_ratio if warmup_ratio > 0 else 1.0
-    if USE_COSINE_SCHEDULE:
-        # Cosine annealing from 1.0 to 0.01
-        cos_progress = (progress - warmup_ratio) / (1.0 - warmup_ratio)
-        return 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * cos_progress))
-    else:
-        return 1.0
+t_train_end = time.time()
+training_seconds = t_train_end - t_start
+
+# Evaluate best model
+best_weights = os.path.join("runs", "train", "weights", "best.pt")
+if not os.path.exists(best_weights):
+    best_weights = os.path.join("runs", "train", "weights", "last.pt")
+
+print(f"\nEvaluating: {best_weights}")
+eval_results = evaluate(best_weights, data_yaml, device=device)
 
 # ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-
-t_start_training = time.time()
-total_training_time = 0.0
-step = 0
-epoch = 0
-best_val_acc = 0.0
-smooth_train_loss = 0.0
-
-model.train()
-
-while True:
-    epoch += 1
-    for images, labels in train_loader:
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.time()
-
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        # Forward pass with mixed precision
-        if use_amp and device.type == "cuda":
-            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                logits = model(images)
-                loss = criterion(logits, labels)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        elif use_amp and device.type == "mps":
-            with torch.amp.autocast(device_type="mps", dtype=torch.float16):
-                logits = model(images)
-                loss = criterion(logits, labels)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-        else:
-            logits = model(images)
-            loss = criterion(logits, labels)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-        optimizer.zero_grad(set_to_none=True)
-
-        train_loss_f = loss.item()
-
-        # Fast fail: abort if loss is NaN or exploding
-        if math.isnan(train_loss_f) or train_loss_f > 100:
-            print("\nFAIL: loss exploded")
-            exit(1)
-
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-
-        t1 = time.time()
-        dt = t1 - t0
-
-        if step > 5:
-            total_training_time += dt
-
-        # Update learning rate
-        progress = min(total_training_time / TIME_BUDGET, 1.0)
-        lrm = get_lr_multiplier(progress)
-        for group in optimizer.param_groups:
-            if "initial_lr" not in group:
-                group["initial_lr"] = group["lr"]
-            group["lr"] = group["initial_lr"] * lrm
-
-        # Logging
-        ema_beta = 0.9
-        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
-
-        pct_done = 100 * progress
-        remaining = max(0, TIME_BUDGET - total_training_time)
-
-        # Compute batch accuracy
-        with torch.no_grad():
-            preds = logits.argmax(dim=1)
-            batch_acc = (preds == labels).float().mean().item()
-
-        print(f"\rstep {step:05d} ep{epoch} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.4f} | "
-              f"acc: {batch_acc:.3f} | lrm: {lrm:.3f} | dt: {dt*1000:.0f}ms | "
-              f"remaining: {remaining:.0f}s    ", end="", flush=True)
-
-        # GC management
-        if step == 0:
-            gc.collect()
-            if device.type == "cuda":
-                gc.freeze()
-                gc.disable()
-
-        step += 1
-
-        # Time's up — stop after warmup steps
-        if step > 5 and total_training_time >= TIME_BUDGET:
-            break
-
-    if step > 5 and total_training_time >= TIME_BUDGET:
-        break
-
-print()  # newline after \r training log
-print(f"Training complete: {step} steps, {epoch} epochs, {total_training_time:.1f}s")
-
-# ---------------------------------------------------------------------------
-# Final evaluation
-# ---------------------------------------------------------------------------
-
-model.eval()
-results = evaluate(model, val_loader, device, num_classes=actual_num_classes,
-                   class_names=train_dataset.classes)
-
 # Print summary
-t_end = time.time()
-startup_time = t_start_training - t_start
+# ---------------------------------------------------------------------------
 
-if device.type == "cuda":
+t_end = time.time()
+
+if device == "cuda" and torch.cuda.is_available():
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-elif device.type == "mps":
-    peak_vram_mb = 0.0  # MPS doesn't provide memory tracking like CUDA
 else:
     peak_vram_mb = 0.0
 
 print()
-print("Classification Report:")
-print(results["report"])
-
-print("Per-class accuracy:")
-for name, acc in results["per_class_acc"].items():
-    print(f"  {name}: {acc:.4f}")
-
-print()
 print("---")
-print(f"val_acc:          {results['val_acc']:.6f}")
-print(f"val_f1:           {results['val_f1']:.6f}")
-print(f"val_loss:         {results['val_loss']:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
+print(f"val_mAP50:        {eval_results['val_mAP50']:.6f}")
+print(f"val_mAP50_95:     {eval_results['val_mAP50_95']:.6f}")
+print(f"val_precision:    {eval_results['val_precision']:.6f}")
+print(f"val_recall:       {eval_results['val_recall']:.6f}")
+print(f"training_seconds: {training_seconds:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_epochs:       {epoch}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"num_trainable_M:  {num_trainable / 1e6:.1f}")
-print(f"num_classes:      {actual_num_classes}")
+print(f"num_classes:      {NUM_CLASSES}")
 print(f"batch_size:       {BATCH_SIZE}")
+print(f"model:            {MODEL_SIZE}")
+print(f"image_size:       {IMAGE_SIZE}")
+
+if eval_results.get("per_class_mAP50"):
+    print()
+    print("Per-class mAP50:")
+    for name, ap in eval_results["per_class_mAP50"].items():
+        print(f"  {name}: {ap:.4f}")

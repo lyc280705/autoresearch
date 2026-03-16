@@ -1,6 +1,7 @@
 """
-One-time data preparation for garbage classification experiments.
-Downloads the TrashNet dataset and organizes it into 4 Chinese waste categories.
+One-time data preparation for garbage OBJECT DETECTION experiments.
+Downloads the TACO (Trash Annotations in Context) dataset and converts it
+to YOLO format with 4 Chinese waste categories.
 
 Usage:
     python prepare.py                  # full prep (download + organize)
@@ -9,37 +10,36 @@ Usage:
 Data is stored in ~/.cache/autoresearch/.
 
 The 4 Chinese waste categories (国内四分类):
-  0: 可回收物 (Recyclable)   — cardboard, paper, plastic, glass, metal
-  1: 有害垃圾 (Hazardous)    — (user-supplied, e.g. batteries, bulbs)
-  2: 厨余垃圾 (Kitchen waste) — (user-supplied, e.g. food scraps)
-  3: 其他垃圾 (Other waste)   — trash, non-recyclable items
+  0: 可回收物 (Recyclable)   — paper, clean plastics, glass, metal
+  1: 有害垃圾 (Hazardous)    — batteries, aerosols, medicine packaging
+  2: 厨余垃圾 (Kitchen waste) — food scraps, fruit peels
+  3: 其他垃圾 (Other waste)   — contaminated items, cigarettes, mixed waste
 
-When using the default TrashNet dataset, only Recyclable and Other have data.
-Users are encouraged to add their own photos for all 4 categories.
+Dataset: TACO (Trash Annotations in Context)
+  - ~1500 images with ~5000 bounding-box annotations
+  - 60 fine-grained categories mapped to 4 Chinese categories
+  - Real-world scenes with MULTIPLE garbage items per image
+  - COCO-format annotations converted to YOLO format
 """
 
 import os
 import sys
+import json
 import time
 import shutil
 import zipfile
 import random
 import argparse
+import concurrent.futures
+from collections import defaultdict
 
 import requests
-import numpy as np
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-from torchvision import transforms
-from PIL import Image
-from sklearn.metrics import f1_score, classification_report
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-IMAGE_SIZE = 224          # input image resolution
+IMAGE_SIZE = 640          # YOLO input image resolution
 TIME_BUDGET = 300         # training time budget in seconds (5 minutes)
 NUM_CLASSES = 4           # 4 Chinese waste categories
 VAL_RATIO = 0.15          # fraction of data for validation
@@ -50,14 +50,84 @@ RANDOM_SEED = 42          # reproducible splits
 CLASS_NAMES = ["可回收物", "有害垃圾", "厨余垃圾", "其他垃圾"]
 CLASS_NAMES_EN = ["recyclable", "hazardous", "kitchen", "other"]
 
-# TrashNet category → Chinese category mapping
-TRASHNET_MAPPING = {
-    "cardboard": 0,  # 可回收物
-    "glass":     0,  # 可回收物
-    "metal":     0,  # 可回收物
-    "paper":     0,  # 可回收物
-    "plastic":   0,  # 可回收物
-    "trash":     3,  # 其他垃圾
+# ---------------------------------------------------------------------------
+# TACO category name → Chinese 4-category ID mapping
+#
+# Based on Chinese national waste sorting standard (GB/T 19095-2019):
+#   0 可回收物: clean paper, plastic, glass, metal, fabric
+#   1 有害垃圾: batteries, aerosols, medicine, chemicals
+#   2 厨余垃圾: food waste, organic matter
+#   3 其他垃圾: contaminated items, mixed waste, non-recyclable
+# ---------------------------------------------------------------------------
+
+TACO_NAME_TO_CHINESE = {
+    # 0: 可回收物 (Recyclable) — clean recyclable materials
+    "Aluminium foil": 0,
+    "Other plastic bottle": 0,
+    "Clear plastic bottle": 0,
+    "Glass bottle": 0,
+    "Plastic bottle cap": 0,
+    "Metal bottle cap": 0,
+    "Food Can": 0,
+    "Drink can": 0,
+    "Toilet tube": 0,
+    "Other carton": 0,
+    "Egg carton": 0,
+    "Drink carton": 0,
+    "Corrugated carton": 0,
+    "Meal carton": 0,
+    "Pizza box": 0,
+    "Paper cup": 0,
+    "Glass cup": 0,
+    "Glass jar": 0,
+    "Plastic lid": 0,
+    "Metal lid": 0,
+    "Magazine paper": 0,
+    "Wrapping paper": 0,
+    "Normal paper": 0,
+    "Paper bag": 0,
+    "Spread tub": 0,
+    "Tupperware": 0,
+    "Pop tab": 0,
+    "Scrap metal": 0,
+    "Paper straw": 0,
+
+    # 1: 有害垃圾 (Hazardous) — dangerous / chemical waste
+    "Battery": 1,
+    "Aluminium blister pack": 1,
+    "Carded blister pack": 1,
+    "Aerosol": 1,
+
+    # 2: 厨余垃圾 (Kitchen waste) — food / organic waste
+    "Food waste": 2,
+
+    # 3: 其他垃圾 (Other waste) — contaminated / non-recyclable
+    "Broken glass": 3,
+    "Disposable plastic cup": 3,
+    "Foam cup": 3,
+    "Other plastic cup": 3,
+    "Other plastic": 3,
+    "Tissues": 3,
+    "Plastified paper bag": 3,
+    "Plastic Film": 3,
+    "Six pack rings": 3,
+    "Garbage bag": 3,
+    "Other plastic wrapper": 3,
+    "Single-use carrier bag": 3,
+    "Polypropylene bag": 3,
+    "Crisp packet": 3,
+    "Disposable food container": 3,
+    "Foam food container": 3,
+    "Other plastic container": 3,
+    "Plastic glooves": 3,
+    "Plastic utensils": 3,
+    "Rope & strings": 3,
+    "Shoe": 3,
+    "Squeezable tube": 3,
+    "Plastic straw": 3,
+    "Styrofoam piece": 3,
+    "Unlabeled litter": 3,
+    "Cigarette": 3,
 }
 
 # ---------------------------------------------------------------------------
@@ -66,13 +136,15 @@ TRASHNET_MAPPING = {
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
-TRASHNET_URL = "https://github.com/garythung/trashnet/raw/master/data/dataset-resized.zip"
+
+# TACO repository zip (contains annotations.json)
+TACO_ZIP_URL = "https://github.com/pedropro/TACO/archive/refs/heads/master.zip"
 
 # ---------------------------------------------------------------------------
-# Data download and organization
+# Data download helpers
 # ---------------------------------------------------------------------------
 
-def download_file(url, filepath, max_attempts=5):
+def download_file(url, filepath, max_attempts=5, timeout=120):
     """Download a file with retries. Returns True on success."""
     if os.path.exists(filepath):
         return True
@@ -80,7 +152,7 @@ def download_file(url, filepath, max_attempts=5):
     for attempt in range(1, max_attempts + 1):
         try:
             print(f"  Downloading (attempt {attempt}/{max_attempts})...")
-            response = requests.get(url, stream=True, timeout=60, allow_redirects=True)
+            response = requests.get(url, stream=True, timeout=timeout, allow_redirects=True)
             response.raise_for_status()
             temp_path = filepath + ".tmp"
             total = int(response.headers.get("content-length", 0))
@@ -92,7 +164,8 @@ def download_file(url, filepath, max_attempts=5):
                         downloaded += len(chunk)
                         if total > 0:
                             pct = 100 * downloaded / total
-                            print(f"\r  Progress: {pct:.1f}% ({downloaded // 1024 // 1024}MB)", end="", flush=True)
+                            print(f"\r  Progress: {pct:.1f}% ({downloaded // 1024 // 1024}MB)",
+                                  end="", flush=True)
             print()
             os.rename(temp_path, filepath)
             return True
@@ -109,354 +182,337 @@ def download_file(url, filepath, max_attempts=5):
     return False
 
 
-def organize_trashnet(zip_path, data_dir):
-    """Extract TrashNet zip and organize into 4 Chinese categories."""
-    train_dir = os.path.join(data_dir, "train")
-    val_dir = os.path.join(data_dir, "val")
-    test_dir = os.path.join(data_dir, "test")
+def _download_single_image(args):
+    """Download one image. Returns (image_id, filepath, success)."""
+    image_id, url, filepath = args
+    if os.path.exists(filepath):
+        return image_id, filepath, True
+    try:
+        resp = requests.get(url, timeout=15, allow_redirects=True)
+        resp.raise_for_status()
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "wb") as f:
+            f.write(resp.content)
+        return image_id, filepath, True
+    except (requests.RequestException, IOError):
+        return image_id, filepath, False
 
-    # Check if already organized
-    if os.path.exists(train_dir) and os.path.exists(val_dir):
-        n_train = sum(len(os.listdir(os.path.join(train_dir, d)))
-                      for d in os.listdir(train_dir) if os.path.isdir(os.path.join(train_dir, d)))
-        if n_train > 0:
-            print(f"Data: already organized at {data_dir} ({n_train} training images)")
-            return
 
-    print("Data: extracting and organizing TrashNet dataset...")
+# ---------------------------------------------------------------------------
+# TACO dataset download and conversion
+# ---------------------------------------------------------------------------
 
-    # Extract zip
-    extract_dir = os.path.join(data_dir, "_extract")
-    with zipfile.ZipFile(zip_path, "r") as z:
-        z.extractall(extract_dir)
+def download_taco_annotations(cache_dir):
+    """Download TACO repo zip and extract annotations.json."""
+    ann_path = os.path.join(cache_dir, "taco_annotations.json")
+    if os.path.exists(ann_path):
+        print("TACO annotations: already downloaded")
+        return ann_path
 
-    # Find the actual image directories
-    # TrashNet zip structure: dataset-resized/{cardboard,glass,metal,paper,plastic,trash}/
-    img_root = None
-    for root, dirs, files in os.walk(extract_dir):
-        if "cardboard" in dirs and "glass" in dirs:
-            img_root = root
-            break
-
-    if img_root is None:
-        print("Error: Could not find TrashNet image directories in zip")
+    # Download the TACO repo zip
+    zip_path = os.path.join(cache_dir, "taco-master.zip")
+    print("Downloading TACO repository...")
+    if not download_file(TACO_ZIP_URL, zip_path, max_attempts=3, timeout=120):
+        print("\nError: Failed to download TACO repository.")
+        print("You can manually download from:")
+        print(f"  {TACO_ZIP_URL}")
+        print(f"And place the zip at: {zip_path}")
         sys.exit(1)
 
-    # Collect all images by Chinese category
-    images_by_class = {i: [] for i in range(NUM_CLASSES)}
-    for trashnet_class, chinese_class in TRASHNET_MAPPING.items():
-        class_dir = os.path.join(img_root, trashnet_class)
-        if not os.path.exists(class_dir):
-            continue
-        for fname in os.listdir(class_dir):
-            if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
-                images_by_class[chinese_class].append(os.path.join(class_dir, fname))
+    # Extract annotations.json from the zip
+    print("Extracting annotations...")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        # Find annotations.json in the zip
+        ann_names = [n for n in z.namelist() if n.endswith("annotations.json")]
+        if not ann_names:
+            print("Error: annotations.json not found in TACO zip")
+            sys.exit(1)
+        with z.open(ann_names[0]) as src, open(ann_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
 
-    # Create split directories
+    print(f"Extracted annotations to: {ann_path}")
+    return ann_path
+
+
+def download_taco_images(coco_data, images_dir, max_workers=8):
+    """Download TACO images from Flickr URLs in parallel."""
+    images = {img["id"]: img for img in coco_data["images"]}
+
+    # Build download task list
+    tasks = []
+    for img_id, img_info in images.items():
+        url = img_info.get("flickr_url") or img_info.get("coco_url", "")
+        if not url:
+            continue
+        ext = os.path.splitext(img_info.get("file_name", ""))[1] or ".jpg"
+        filepath = os.path.join(images_dir, f"{img_id}{ext}")
+        tasks.append((img_id, url, filepath))
+
+    # Count already downloaded
+    already = sum(1 for _, _, fp in tasks if os.path.exists(fp))
+    remaining = len(tasks) - already
+    if remaining == 0:
+        print(f"TACO images: all {already} images already downloaded")
+        return
+
+    print(f"Downloading TACO images: {remaining} remaining ({already} already cached)...")
+
+    success = already
+    failed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_download_single_image, t) for t in tasks
+                   if not os.path.exists(t[2])]
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            _, _, ok = future.result()
+            if ok:
+                success += 1
+            else:
+                failed += 1
+            done = i + 1
+            if done % 100 == 0 or done == len(futures):
+                print(f"  Progress: {done}/{len(futures)} "
+                      f"(total success: {success}, failed: {failed})")
+
+    print(f"Download complete: {success} images available, {failed} failed")
+    if success < 200:
+        print("Warning: fewer than 200 images available. Model quality may be limited.")
+        print("Consider manually adding garbage images to the dataset.")
+
+
+def convert_taco_to_yolo(coco_data, images_dir, data_dir):
+    """Convert TACO COCO annotations to YOLO format with 4-category mapping."""
+    images = {img["id"]: img for img in coco_data["images"]}
+    categories = {cat["id"]: cat["name"] for cat in coco_data["categories"]}
+
+    # Build TACO category ID → Chinese 4-category mapping
+    taco_id_to_chinese = {}
+    unmapped = []
+    for cat_id, cat_name in categories.items():
+        if cat_name in TACO_NAME_TO_CHINESE:
+            taco_id_to_chinese[cat_id] = TACO_NAME_TO_CHINESE[cat_name]
+        else:
+            unmapped.append(cat_name)
+            # Default unmapped categories to "其他垃圾" (Other waste)
+            taco_id_to_chinese[cat_id] = 3
+
+    if unmapped:
+        print(f"  Note: {len(unmapped)} categories not in mapping (defaulted to 其他垃圾):")
+        for name in unmapped:
+            print(f"    - {name}")
+
+    # Group annotations by image
+    anns_by_image = defaultdict(list)
+    for ann in coco_data["annotations"]:
+        anns_by_image[ann["image_id"]].append(ann)
+
+    # Filter to images that exist on disk and have annotations
+    valid_ids = []
+    for img_id, img_info in images.items():
+        if img_id not in anns_by_image:
+            continue
+        ext = os.path.splitext(img_info.get("file_name", ""))[1] or ".jpg"
+        filepath = os.path.join(images_dir, f"{img_id}{ext}")
+        if os.path.exists(filepath):
+            valid_ids.append(img_id)
+
+    print(f"  Valid images with annotations: {len(valid_ids)}")
+
+    # Split into train/val/test
     random.seed(RANDOM_SEED)
-    for split_name, split_dir in [("train", train_dir), ("val", val_dir), ("test", test_dir)]:
-        for i in range(NUM_CLASSES):
-            os.makedirs(os.path.join(split_dir, CLASS_NAMES_EN[i]), exist_ok=True)
+    random.shuffle(valid_ids)
+    n = len(valid_ids)
+    n_test = max(1, int(n * TEST_RATIO))
+    n_val = max(1, int(n * VAL_RATIO))
+    n_train = n - n_val - n_test
 
-    # Split and copy images
-    total_images = 0
-    for class_idx, paths in images_by_class.items():
-        if not paths:
-            print(f"  Warning: No images for class {CLASS_NAMES[class_idx]} ({CLASS_NAMES_EN[class_idx]})")
-            continue
+    splits = {
+        "train": valid_ids[:n_train],
+        "val": valid_ids[n_train:n_train + n_val],
+        "test": valid_ids[n_train + n_val:],
+    }
 
-        random.shuffle(paths)
-        n = len(paths)
-        n_test = max(1, int(n * TEST_RATIO))
-        n_val = max(1, int(n * VAL_RATIO))
-        n_train = n - n_val - n_test
+    # Convert and write YOLO format labels
+    class_counts = defaultdict(lambda: defaultdict(int))
 
-        splits = {
-            "train": (train_dir, paths[:n_train]),
-            "val": (val_dir, paths[n_train:n_train + n_val]),
-            "test": (test_dir, paths[n_train + n_val:]),
-        }
+    for split_name, split_ids in splits.items():
+        split_img_dir = os.path.join(data_dir, split_name, "images")
+        split_lbl_dir = os.path.join(data_dir, split_name, "labels")
+        os.makedirs(split_img_dir, exist_ok=True)
+        os.makedirs(split_lbl_dir, exist_ok=True)
 
-        for split_name, (split_dir, split_paths) in splits.items():
-            class_dir = os.path.join(split_dir, CLASS_NAMES_EN[class_idx])
-            for src in split_paths:
-                dst = os.path.join(class_dir, os.path.basename(src))
-                shutil.copy2(src, dst)
-                total_images += 1
+        for img_id in split_ids:
+            img_info = images[img_id]
+            ext = os.path.splitext(img_info.get("file_name", ""))[1] or ".jpg"
+            src_path = os.path.join(images_dir, f"{img_id}{ext}")
 
-        print(f"  {CLASS_NAMES[class_idx]:8s} ({CLASS_NAMES_EN[class_idx]:12s}): "
-              f"{n_train} train, {n_val} val, {n_test} test ({n} total)")
+            # Copy image to split directory
+            dst_img = os.path.join(split_img_dir, f"{img_id}{ext}")
+            if not os.path.exists(dst_img):
+                shutil.copy2(src_path, dst_img)
 
-    # Clean up extracted files
-    shutil.rmtree(extract_dir, ignore_errors=True)
+            # Convert annotations to YOLO format
+            img_w = img_info["width"]
+            img_h = img_info["height"]
+            label_lines = []
 
-    print(f"Data: organized {total_images} images into {data_dir}")
+            for ann in anns_by_image[img_id]:
+                cat_id = ann["category_id"]
+                chinese_id = taco_id_to_chinese.get(cat_id, 3)
 
+                # COCO bbox: [x_min, y_min, width, height] in pixels
+                bx, by, bw, bh = ann["bbox"]
+                # YOLO bbox: [x_center, y_center, width, height] normalized to 0-1
+                x_center = min(max((bx + bw / 2) / img_w, 0.0), 1.0)
+                y_center = min(max((by + bh / 2) / img_h, 0.0), 1.0)
+                w_norm = min(max(bw / img_w, 0.001), 1.0)
+                h_norm = min(max(bh / img_h, 0.001), 1.0)
+
+                label_lines.append(
+                    f"{chinese_id} {x_center:.6f} {y_center:.6f} {w_norm:.6f} {h_norm:.6f}"
+                )
+                class_counts[split_name][chinese_id] += 1
+
+            stem = os.path.splitext(f"{img_id}{ext}")[0]
+            label_path = os.path.join(split_lbl_dir, f"{stem}.txt")
+            with open(label_path, "w") as f:
+                f.write("\n".join(label_lines) + "\n" if label_lines else "")
+
+    # Print statistics
+    for split_name in ["train", "val", "test"]:
+        total = sum(class_counts[split_name].values())
+        print(f"  {split_name}: {len(splits[split_name])} images, {total} annotations")
+        for cls_id in range(NUM_CLASSES):
+            count = class_counts[split_name].get(cls_id, 0)
+            print(f"    {CLASS_NAMES[cls_id]} ({CLASS_NAMES_EN[cls_id]}): {count}")
+
+    return splits
+
+
+def create_data_yaml(data_dir):
+    """Create YOLO data.yaml configuration file."""
+    yaml_path = os.path.join(data_dir, "data.yaml")
+    content = (
+        f"# YOLO data config — garbage detection (4-category Chinese waste sorting)\n"
+        f"path: {data_dir}\n"
+        f"train: train/images\n"
+        f"val: val/images\n"
+        f"test: test/images\n"
+        f"\n"
+        f"nc: {NUM_CLASSES}\n"
+        f"names:\n"
+        f"  0: recyclable\n"
+        f"  1: hazardous\n"
+        f"  2: kitchen\n"
+        f"  3: other\n"
+        f"\n"
+        f"# Chinese names:\n"
+        f"# 0: 可回收物  1: 有害垃圾  2: 厨余垃圾  3: 其他垃圾\n"
+    )
+    with open(yaml_path, "w") as f:
+        f.write(content)
+    print(f"Created data config: {yaml_path}")
+    return yaml_path
+
+
+def get_data_yaml_path(data_dir=None):
+    """Return the path to data.yaml (convenience helper for train.py)."""
+    if data_dir is None:
+        data_dir = DATA_DIR
+    return os.path.join(data_dir, "data.yaml")
+
+
+# ---------------------------------------------------------------------------
+# Main download-and-prepare pipeline
+# ---------------------------------------------------------------------------
 
 def download_and_prepare(data_dir=None):
-    """Download TrashNet and organize into 4-category structure."""
+    """Download TACO dataset and prepare YOLO-format data."""
     if data_dir is None:
         data_dir = DATA_DIR
 
-    # Check for existing organized data
-    train_dir = os.path.join(data_dir, "train")
-    if os.path.exists(train_dir):
-        class_dirs = [d for d in os.listdir(train_dir)
-                      if os.path.isdir(os.path.join(train_dir, d))]
-        n_images = sum(len(os.listdir(os.path.join(train_dir, d))) for d in class_dirs)
-        if n_images > 0:
-            print(f"Data: found {n_images} training images in {len(class_dirs)} classes at {data_dir}")
-            return
+    yaml_path = os.path.join(data_dir, "data.yaml")
 
-    # Download TrashNet
-    zip_path = os.path.join(CACHE_DIR, "trashnet.zip")
-    print(f"Data: downloading TrashNet dataset...")
-    if not download_file(TRASHNET_URL, zip_path):
-        print("\nError: Failed to download TrashNet dataset.")
-        print("You can manually download it from:")
-        print(f"  {TRASHNET_URL}")
-        print(f"And place it at: {zip_path}")
-        print("\nAlternatively, organize your own images into:")
-        print(f"  {data_dir}/train/{{recyclable,hazardous,kitchen,other}}/")
-        print(f"  {data_dir}/val/{{recyclable,hazardous,kitchen,other}}/")
-        sys.exit(1)
+    # Skip if already prepared
+    train_imgs = os.path.join(data_dir, "train", "images")
+    if os.path.exists(yaml_path) and os.path.isdir(train_imgs):
+        n = len([f for f in os.listdir(train_imgs)
+                 if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+        if n > 0:
+            print(f"Data: already prepared at {data_dir} ({n} training images)")
+            return yaml_path
 
-    # Organize into categories
-    organize_trashnet(zip_path, data_dir)
+    # Step 1: Download annotations
+    ann_path = download_taco_annotations(CACHE_DIR)
+
+    # Step 2: Parse annotations
+    with open(ann_path) as f:
+        coco_data = json.load(f)
+    print(f"TACO: {len(coco_data['images'])} images, "
+          f"{len(coco_data['annotations'])} annotations, "
+          f"{len(coco_data['categories'])} categories")
+
+    # Step 3: Download images
+    images_dir = os.path.join(CACHE_DIR, "taco_images")
+    os.makedirs(images_dir, exist_ok=True)
+    download_taco_images(coco_data, images_dir)
+
+    # Step 4: Convert to YOLO format
+    print("Converting to YOLO format...")
+    convert_taco_to_yolo(coco_data, images_dir, data_dir)
+
+    # Step 5: Create data.yaml
+    yaml_path = create_data_yaml(data_dir)
+
+    return yaml_path
 
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Evaluation (DO NOT CHANGE — this is the fixed metric for object detection)
 # ---------------------------------------------------------------------------
 
-class GarbageDataset(Dataset):
-    """Image classification dataset using directory structure.
-
-    Expected layout:
-        root/
-          class_name_1/
-            img001.jpg
-            img002.jpg
-          class_name_2/
-            img003.jpg
-            ...
+def evaluate(model, data_yaml, device=None):
     """
-
-    def __init__(self, root_dir, transform=None, class_to_idx=None):
-        self.root_dir = root_dir
-        self.transform = transform
-        self.samples = []
-        self.targets = []
-
-        if class_to_idx is not None:
-            self.class_to_idx = class_to_idx
-        else:
-            # Auto-detect classes from directory names, only include non-empty dirs
-            classes = sorted(d for d in os.listdir(root_dir)
-                           if os.path.isdir(os.path.join(root_dir, d))
-                           and any(f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))
-                                   for f in os.listdir(os.path.join(root_dir, d))))
-            self.class_to_idx = {c: i for i, c in enumerate(classes)}
-
-        self.classes = list(self.class_to_idx.keys())
-        self.idx_to_class = {v: k for k, v in self.class_to_idx.items()}
-
-        for class_name, class_idx in self.class_to_idx.items():
-            class_dir = os.path.join(root_dir, class_name)
-            if not os.path.isdir(class_dir):
-                continue
-            for fname in sorted(os.listdir(class_dir)):
-                if fname.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
-                    self.samples.append(os.path.join(class_dir, fname))
-                    self.targets.append(class_idx)
-
-        self.targets = np.array(self.targets, dtype=np.int64)
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        img_path = self.samples[idx]
-        label = self.targets[idx]
-        image = Image.open(img_path).convert("RGB")
-        if self.transform:
-            image = self.transform(image)
-        return image, label
-
-    def get_class_weights(self):
-        """Compute inverse-frequency class weights for balanced training."""
-        counts = np.bincount(self.targets, minlength=len(self.class_to_idx))
-        # Use max(count, 1) to avoid division by zero for any empty classes
-        # (empty classes get a weight but won't affect training since they have no samples)
-        counts = np.maximum(counts, 1)
-        weights = 1.0 / counts.astype(np.float64)
-        weights = weights / weights.sum() * len(self.class_to_idx)
-        return torch.tensor(weights, dtype=torch.float32)
-
-    def get_sample_weights(self):
-        """Compute per-sample weights for WeightedRandomSampler."""
-        class_weights = self.get_class_weights().numpy()
-        return [class_weights[t] for t in self.targets]
-
-
-def get_train_transform(image_size=IMAGE_SIZE):
-    """Training data augmentation pipeline."""
-    return transforms.Compose([
-        transforms.RandomResizedCrop(image_size, scale=(0.7, 1.0)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(p=0.2),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-        transforms.RandomRotation(15),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-
-def get_val_transform(image_size=IMAGE_SIZE):
-    """Validation/test transform (no augmentation)."""
-    return transforms.Compose([
-        # Resize to ~1.14x the crop size (standard practice to preserve content
-        # when center-cropping; 256/224 ≈ 1.14)
-        transforms.Resize(int(image_size * 1.14)),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
-
-
-def make_dataloader(split, batch_size, image_size=IMAGE_SIZE, data_dir=None,
-                    num_workers=4, balanced_sampling=True):
-    """
-    Create a DataLoader for the specified split.
+    Evaluate object detection model using ultralytics YOLO val().
 
     Args:
-        split: "train", "val", or "test"
-        batch_size: batch size
-        image_size: input image resolution
-        data_dir: data directory (default: DATA_DIR)
-        num_workers: number of data loading workers
-        balanced_sampling: use weighted sampling for training (handles class imbalance)
-
-    Returns:
-        DataLoader, dataset
-    """
-    if data_dir is None:
-        data_dir = DATA_DIR
-
-    split_dir = os.path.join(data_dir, split)
-    assert os.path.isdir(split_dir), f"Split directory not found: {split_dir}. Run prepare.py first."
-
-    if split == "train":
-        transform = get_train_transform(image_size)
-    else:
-        transform = get_val_transform(image_size)
-
-    dataset = GarbageDataset(split_dir, transform=transform)
-    assert len(dataset) > 0, f"No images found in {split_dir}"
-
-    sampler = None
-    shuffle = False
-    if split == "train":
-        if balanced_sampling and len(set(dataset.targets.tolist())) > 1:
-            sample_weights = dataset.get_sample_weights()
-            sampler = WeightedRandomSampler(sample_weights, len(dataset), replacement=True)
-        else:
-            shuffle = True
-
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=(split == "train"),
-        persistent_workers=(num_workers > 0),
-    )
-    return loader, dataset
-
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def evaluate(model, data_loader, device, num_classes=None, class_names=None):
-    """
-    Evaluate model on a data loader.
+        model: ultralytics YOLO model (or path to .pt weights)
+        data_yaml: path to data.yaml
+        device: device string ("cuda", "mps", "cpu", or None for auto)
 
     Returns dict with:
-        val_acc:  overall accuracy (primary metric, higher is better)
-        val_f1:   macro-averaged F1 score
-        val_loss: average cross-entropy loss
-        per_class_acc: per-class accuracy dict
-        report: full sklearn classification report string
+        val_mAP50:     mAP at IoU=0.5 (primary metric, higher is better)
+        val_mAP50_95:  mAP at IoU=0.5:0.95
+        val_precision:  overall precision
+        val_recall:     overall recall
+        per_class_mAP50: dict of per-class mAP50
     """
-    model.eval()
-    all_preds = []
-    all_labels = []
-    total_loss = 0.0
-    total_samples = 0
+    from ultralytics import YOLO
 
-    if num_classes is None:
-        num_classes = NUM_CLASSES
+    if isinstance(model, str):
+        model = YOLO(model)
 
-    for images, labels in data_loader:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    kwargs = {"data": data_yaml, "verbose": False}
+    if device is not None:
+        kwargs["device"] = device
 
-        with torch.amp.autocast(device_type=device.type, dtype=torch.float16,
-                                enabled=(device.type in ("cuda", "mps"))):
-            logits = model(images)
+    results = model.val(**kwargs)
 
-        loss = F.cross_entropy(logits, labels, reduction="sum")
-        total_loss += loss.item()
-        total_samples += labels.size(0)
-
-        preds = logits.argmax(dim=1)
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-
-    # Determine active classes (those present in the dataset)
-    active_classes = sorted(set(all_labels.tolist()))
-    active_names = []
-    for idx in active_classes:
-        if class_names is not None and idx < len(class_names):
-            active_names.append(class_names[idx])
-        elif idx < len(CLASS_NAMES):
-            active_names.append(f"{CLASS_NAMES[idx]}({CLASS_NAMES_EN[idx]})")
-        else:
-            active_names.append(f"class_{idx}")
-
-    accuracy = (all_preds == all_labels).mean()
-    macro_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-    avg_loss = total_loss / max(total_samples, 1)
-
-    # Per-class accuracy
-    per_class_acc = {}
-    for i, idx in enumerate(active_classes):
-        mask = all_labels == idx
-        if mask.sum() > 0:
-            name = active_names[i]
-            per_class_acc[name] = (all_preds[mask] == all_labels[mask]).mean()
-
-    report = classification_report(
-        all_labels, all_preds,
-        labels=active_classes,
-        target_names=active_names,
-        zero_division=0,
-    )
-
-    return {
-        "val_acc": float(accuracy),
-        "val_f1": float(macro_f1),
-        "val_loss": float(avg_loss),
-        "per_class_acc": per_class_acc,
-        "report": report,
+    metrics = {
+        "val_mAP50": float(results.box.map50),
+        "val_mAP50_95": float(results.box.map),
+        "val_precision": float(results.box.mp),
+        "val_recall": float(results.box.mr),
     }
+
+    # Per-class mAP50
+    per_class = {}
+    if hasattr(results.box, "ap50") and results.box.ap50 is not None:
+        for i, ap in enumerate(results.box.ap50):
+            if i < NUM_CLASSES:
+                per_class[f"{CLASS_NAMES[i]}({CLASS_NAMES_EN[i]})"] = float(ap)
+    metrics["per_class_mAP50"] = per_class
+
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +520,9 @@ def evaluate(model, data_loader, device, num_classes=None, class_names=None):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data for garbage classification")
+    parser = argparse.ArgumentParser(
+        description="Prepare TACO dataset for garbage object detection"
+    )
     parser.add_argument("--data-dir", type=str, default=None,
                         help="Custom data directory (default: ~/.cache/autoresearch/data)")
     args = parser.parse_args()
@@ -475,31 +533,23 @@ if __name__ == "__main__":
     print(f"Data directory:  {data_dir}")
     print()
 
-    # Step 1: Download and organize data
-    download_and_prepare(data_dir)
+    # Download and prepare
+    yaml_path = download_and_prepare(data_dir)
     print()
 
-    # Step 2: Print dataset statistics
+    # Print dataset statistics
     print("Dataset statistics:")
     for split in ["train", "val", "test"]:
-        split_dir = os.path.join(data_dir, split)
-        if not os.path.exists(split_dir):
+        img_dir = os.path.join(data_dir, split, "images")
+        lbl_dir = os.path.join(data_dir, split, "labels")
+        if not os.path.isdir(img_dir):
             continue
-        total = 0
-        for class_name in sorted(os.listdir(split_dir)):
-            class_dir = os.path.join(split_dir, class_name)
-            if os.path.isdir(class_dir):
-                n = len([f for f in os.listdir(class_dir)
-                        if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))])
-                total += n
-                print(f"  {split:5s}/{class_name:12s}: {n:4d} images")
-        print(f"  {split:5s} total: {total} images")
-        print()
+        n_imgs = len([f for f in os.listdir(img_dir)
+                      if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+        n_lbls = len([f for f in os.listdir(lbl_dir)
+                      if f.endswith(".txt")]) if os.path.isdir(lbl_dir) else 0
+        print(f"  {split:5s}: {n_imgs} images, {n_lbls} label files")
+    print()
 
-    print("Done! Ready to train.")
-    print()
-    print("To add your own data, place images in:")
-    for en_name, cn_name in zip(CLASS_NAMES_EN, CLASS_NAMES):
-        print(f"  {data_dir}/train/{en_name}/  — {cn_name}")
-    print()
-    print("Then re-run prepare.py to update splits, or directly add to train/val/test folders.")
+    print(f"Data config: {yaml_path}")
+    print("Done! Ready to train with: python train.py")

@@ -1,74 +1,104 @@
-# autoresearch — 垃圾分类 (Garbage Classification)
+# autoresearch — 垃圾目标检测 (Garbage Object Detection)
 
-基于计算机视觉的垃圾自动分类系统，支持国内四分类标准（可回收物、有害垃圾、厨余垃圾、其他垃圾）。
+基于YOLOv8的垃圾目标检测系统——识别一张图片中的**所有垃圾**并逐个分类，支持国内四分类标准（可回收物、有害垃圾、厨余垃圾、其他垃圾）。
 
-An autonomous computer vision research system for garbage classification. An AI agent modifies the training code, trains for 5 minutes, checks if accuracy improved, keeps or discards, and repeats — optimizing the model while you sleep.
+An autonomous computer vision research system for garbage **object detection**. Detects and classifies ALL garbage objects in a single image. An AI agent modifies the training code, trains for 5 minutes, checks if mAP improved, keeps or discards, and repeats.
+
+## 与图像分类的区别 (Difference from Classification)
+
+| | 图像分类 (Classification) | 目标检测 (Object Detection) |
+|---|---|---|
+| 输入 | 一张只含一个物体的图片 | 一张包含多个垃圾的照片 |
+| 输出 | 一个类别标签 | 每个垃圾的位置(边界框)+类别 |
+| 模型 | MobileNet, ResNet, etc. | **YOLOv8**, Faster R-CNN, etc. |
+| 数据集 | TrashNet (单物体) | **TACO** (多物体+标注框) |
+| 评价指标 | Accuracy | **mAP (Mean Average Precision)** |
 
 ## 垃圾分类四类标准 (4-Category Standard)
 
 | 类别 | Category | 示例 Examples |
 |------|----------|--------------|
-| 可回收物 | Recyclable | 纸板、玻璃、金属、纸张、塑料 |
-| 有害垃圾 | Hazardous | 电池、灯泡、药品、油漆 |
-| 厨余垃圾 | Kitchen waste | 食物残渣、果皮、骨头 |
-| 其他垃圾 | Other waste | 纸巾、陶瓷、不可回收物 |
+| 可回收物 | Recyclable | 塑料瓶、玻璃瓶、金属罐、纸板、纸杯 |
+| 有害垃圾 | Hazardous | 电池、气雾罐、药品泡罩包装 |
+| 厨余垃圾 | Kitchen waste | 食物残渣、果皮 |
+| 其他垃圾 | Other waste | 烟头、破碎玻璃、一次性塑料制品、垃圾袋 |
+
+## 数据集 (Dataset)
+
+使用 **TACO (Trash Annotations in Context)** 数据集：
+- ~1500张真实场景图片，~5000个标注框
+- 60种细分垃圾类别 → 映射为4种国内分类
+- COCO格式标注 → 自动转换为YOLO格式
+- 每张图片可能包含多个垃圾目标
 
 ## How it works
 
-The repo has three files that matter:
+The repo has four files that matter:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads TrashNet dataset, organizes into categories), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the CNN model (MobileNetV2 baseline), optimizer, and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`prepare.py`** — fixed constants, TACO data download + YOLO format conversion, and evaluation harness. Not modified by agent.
+- **`train.py`** — the single file the agent edits. YOLOv8 model config, hyperparameters, augmentation. **This file is edited and iterated on by the agent**.
+- **`predict.py`** — single-image inference script. Detects all garbage and shows results.
 - **`program.md`** — baseline instructions for the agent. **This file is edited and iterated on by the human**.
 
-Training runs for a **fixed 5-minute time budget** (wall clock, excluding startup). The metric is **val_acc** (validation accuracy) — higher is better.
+Training runs for a **fixed 5-minute time budget** (wall clock). The primary metric is **val_mAP50** (mean Average Precision at IoU=0.5) — higher is better.
 
 ## Quick start
 
-**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), and one of:
-- NVIDIA GPU (CUDA)
-- Apple Silicon Mac (MPS) — tested on M4 Pro with 24GB
-- CPU (slower but works)
+**Requirements:** Python 3.10+, conda environment with PyTorch
 
 ```bash
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# 1. Activate conda environment
+conda activate Pytorch
 
-# 2. Install dependencies
-uv sync
+# 2. Install additional dependencies
+pip install ultralytics
 
-# 3. Download data and organize into categories (one-time, ~2 min)
-uv run prepare.py
+# 3. Download TACO dataset and prepare YOLO format data (~5-15 min)
+python prepare.py
 
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+# 4. Train the object detection model (~5 min)
+python train.py
+
+# 5. Detect garbage in a photo
+python predict.py your_photo.jpg --save result.jpg
 ```
 
-## Using your own data
+## Environment setup
 
-The system uses an ImageFolder structure. To use your own garbage photos:
+If creating a new conda environment from scratch:
 
-```
-~/.cache/autoresearch/data/
-  train/
-    recyclable/     ← 可回收物 photos
-    hazardous/      ← 有害垃圾 photos
-    kitchen/        ← 厨余垃圾 photos
-    other/          ← 其他垃圾 photos
-  val/
-    recyclable/
-    hazardous/
-    kitchen/
-    other/
+```bash
+conda env create -f environment.yml
+conda activate Pytorch
 ```
 
-Simply place your photos (`.jpg`, `.png`, etc.) in the appropriate directories. The system auto-detects classes from subdirectory names.
+Or install into existing "Pytorch" environment:
 
-**Tips for collecting data:**
-- Use your phone camera to take photos of garbage items
-- Aim for 50-100+ images per category for good results
-- Include variety: different lighting, angles, backgrounds
-- The default TrashNet dataset provides ~2500 images for recyclable and other categories
+```bash
+conda activate Pytorch
+pip install ultralytics
+```
+
+## 拍照识别 (Photo Detection)
+
+Train the model, then detect garbage in any photo:
+
+```bash
+# Detect garbage in a photo and save annotated result
+python predict.py photo.jpg --save result.jpg
+
+# Adjust confidence threshold (lower = more detections)
+python predict.py photo.jpg --conf 0.15 --save result.jpg
+
+# Use a specific model checkpoint
+python predict.py photo.jpg --model runs/train/weights/best.pt --save result.jpg
+```
+
+The output shows:
+- Bounding boxes around each detected garbage item
+- Category labels (可回收物/有害垃圾/厨余垃圾/其他垃圾)
+- Confidence scores
+- Category summary (count per category)
 
 ## Running the agent
 
@@ -79,38 +109,40 @@ Hi, have a look at program.md and let's kick off a new experiment! Let's do the 
 ```
 
 The agent will autonomously:
-1. Establish a baseline with the default MobileNetV2 model
-2. Try different architectures (ResNet, EfficientNet, ViT, etc.)
-3. Experiment with hyperparameters, data augmentation, training strategies
+1. Establish a baseline with YOLOv8s
+2. Try different model sizes (YOLOv8n/s/m)
+3. Experiment with hyperparameters, augmentation, loss weights
 4. Keep improvements, discard regressions
 5. Log all results to `results.tsv`
 
 ## Project structure
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+prepare.py       — TACO data download, YOLO conversion, evaluation (do not modify)
+train.py         — YOLOv8 training config and hyperparameters (agent modifies this)
+predict.py       — single-image inference (detect all garbage in a photo)
+program.md       — agent instructions
+environment.yml  — conda environment specification
+pyproject.toml   — Python project metadata
 ```
 
 ## Design choices
 
-- **Single file to modify.** The agent only touches `train.py`. Diffs are reviewable.
+- **Object detection, not classification.** Detects ALL garbage objects in one image, not just one label.
+- **TACO dataset.** Real-world images with bounding-box annotations, mapped to Chinese 4-category standard.
+- **YOLOv8 baseline.** State-of-the-art real-time object detection, supports MPS (Apple Silicon).
 - **Fixed time budget.** Training always runs for exactly 5 minutes. ~12 experiments/hour, ~100 overnight.
-- **Cross-platform.** Supports CUDA, MPS (Apple Silicon), and CPU.
-- **Transfer learning baseline.** MobileNetV2 pretrained on ImageNet provides a strong starting point.
-- **Class imbalance handling.** Weighted sampling and class-weighted loss handle imbalanced datasets.
+- **Single file to modify.** The agent only touches `train.py`. Diffs are reviewable.
+- **conda + PyTorch.** Uses local conda environment named "Pytorch".
 
 ## Baseline model
 
 The default `train.py` uses:
-- **Backbone**: MobileNetV2 (pretrained on ImageNet, partially frozen)
-- **Head**: Dropout → FC(256) → ReLU → Dropout → FC(num_classes)
-- **Optimizer**: AdamW with different LRs for backbone and head
-- **Schedule**: Warmup + cosine annealing
-- **Loss**: Cross-entropy with class weights and label smoothing
-- **Data augmentation**: Random crop, flip, color jitter, rotation
+- **Model**: YOLOv8s (small) pretrained on COCO
+- **Image size**: 640×640
+- **Augmentation**: Mosaic, HSV, flip, scale
+- **Optimizer**: SGD with cosine schedule
+- **Time budget**: 5 minutes (using YOLO's built-in time parameter)
 
 ## License
 

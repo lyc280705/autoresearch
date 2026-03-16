@@ -1,6 +1,6 @@
-# autoresearch — 垃圾分类 (Garbage Classification)
+# autoresearch — 垃圾目标检测 (Garbage Object Detection)
 
-This is an experiment to have an AI agent autonomously optimize a garbage classification model.
+This is an experiment to have an AI agent autonomously optimize a garbage **object detection** model.
 
 ## Setup
 
@@ -10,46 +10,63 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, image loading, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/data/train/` contains image subdirectories. If not, tell the human to run `uv run prepare.py`.
+   - `prepare.py` — fixed constants, TACO data prep, YOLO format conversion, evaluation. Do not modify.
+   - `train.py` — the file you modify. YOLOv8 model configuration, hyperparameters, augmentation, training.
+   - `predict.py` — single-image inference script. Usually no need to modify.
+4. **Verify data exists**: Check that `~/.cache/autoresearch/data/train/images/` contains images. If not, tell the human to run `python prepare.py`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
 6. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
-## Task: Garbage Classification (垃圾分类)
+## Task: Garbage Object Detection (垃圾目标检测)
 
-The goal is to build a computer vision model that classifies garbage images into categories. The default dataset is organized into Chinese waste categories following the national 4-category standard:
-- **可回收物 (Recyclable)**: paper, plastic, glass, metal, cardboard
-- **有害垃圾 (Hazardous)**: batteries, bulbs, medicine, paint
-- **厨余垃圾 (Kitchen waste)**: food scraps, fruit peels, bones
-- **其他垃圾 (Other waste)**: tissues, ceramics, non-recyclable items
+The goal is to build a computer vision model that **detects and classifies ALL garbage objects in a single image**. This is an object detection task — each image may contain multiple garbage items, and the model must:
+1. Locate each garbage object with a bounding box
+2. Classify each object into one of 4 Chinese waste categories
 
-The baseline uses TrashNet data mapped to these categories. The framework auto-detects classes from subdirectory names, so it works with any dataset structure.
+The 4 categories follow the Chinese national waste sorting standard:
+- **可回收物 (Recyclable)**: paper, clean plastic bottles, glass, metal, cardboard
+- **有害垃圾 (Hazardous)**: batteries, aerosols, medicine packaging
+- **厨余垃圾 (Kitchen waste)**: food scraps, fruit peels
+- **其他垃圾 (Other waste)**: contaminated items, cigarettes, mixed waste
+
+The dataset is TACO (Trash Annotations in Context) — real-world images with bounding-box annotations for 60 garbage categories, mapped to the 4 Chinese categories.
+
+## Environment
+
+Use the local conda environment named **Pytorch**:
+```bash
+conda activate Pytorch
+```
 
 ## Experimentation
 
-Each experiment runs on a single GPU (CUDA or MPS). The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup). You launch it simply as: `uv run train.py`.
+Each experiment runs on a single GPU (CUDA or MPS). The training script runs for a **fixed time budget of 5 minutes** (wall clock). You launch it simply as: `python train.py`.
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture (backbone, head, attention mechanisms), optimizer, hyperparameters, training loop, batch size, data augmentation strategy, learning rate schedule, regularization, etc.
-- Experiment with different backbones: MobileNetV2, ResNet, EfficientNet, Vision Transformer (ViT), ConvNeXt, etc.
-- Try different training strategies: transfer learning, progressive unfreezing, mixup/cutmix, knowledge distillation, etc.
-- Modify the classification head: add attention, use different pooling, multi-scale features, etc.
+- Modify `train.py` — this is the only file you edit. Everything is fair game:
+  - Model size: `yolov8n.pt` (nano), `yolov8s.pt` (small), `yolov8m.pt` (medium), `yolov8l.pt` (large), `yolov8x.pt` (extra-large)
+  - Learning rate, momentum, weight decay, warmup settings
+  - Augmentation parameters: mosaic, mixup, copy-paste, HSV, rotation, scale, etc.
+  - Loss weights: box, cls, dfl gains
+  - Batch size (trade off VRAM vs. training speed)
+  - Freeze backbone layers (transfer learning strategy)
+  - Confidence and IoU thresholds for inference
+  - Custom YOLO configuration (modify model architecture via YAML)
 
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, transforms, and training constants (time budget, image size, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
+- Modify `prepare.py`. It is read-only. It contains the fixed data preparation, TACO category mapping, and evaluation harness.
+- Install new packages or add dependencies beyond what's already available.
 - Modify the evaluation harness. The `evaluate` function in `prepare.py` is the ground truth metric.
 
-**The goal is simple: get the highest val_acc.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal is simple: get the highest val_mAP50 (mean Average Precision at IoU=0.5).** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything else is fair game.
 
-**VRAM** is a soft constraint. The target platform has 24GB (Apple M4 Pro). Some increase is acceptable for meaningful val_acc gains, but it should not blow up dramatically.
+**VRAM** is a soft constraint. The target platform is Apple M4 Pro with 24GB unified memory. Larger models (yolov8l, yolov8x) may not fit. Use `yolov8s` or `yolov8m` as practical defaults.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome.
+**Simplicity criterion**: All else being equal, simpler is better. A small improvement with ugly complexity is not worth it. Removing something and getting equal or better results is a great outcome.
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+**The first run**: Your very first run should always establish the baseline — run the training script as-is.
 
 ## Output format
 
@@ -57,24 +74,23 @@ Once the script finishes it prints a summary like this:
 
 ```
 ---
-val_acc:          0.850000
-val_f1:           0.820000
-val_loss:         0.450000
-training_seconds: 300.1
+val_mAP50:        0.450000
+val_mAP50_95:     0.280000
+val_precision:    0.650000
+val_recall:       0.420000
+training_seconds: 305.1
 total_seconds:    325.9
 peak_vram_mb:     2048.0
-num_steps:        953
-num_epochs:       15
-num_params_M:     3.5
-num_trainable_M:  1.2
 num_classes:      4
-batch_size:       32
+batch_size:       16
+model:            yolov8s.pt
+image_size:       640
 ```
 
 You can extract the key metric from the log file:
 
 ```
-grep "^val_acc:" run.log
+grep "^val_mAP50:" run.log
 ```
 
 ## Logging results
@@ -84,11 +100,11 @@ When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-se
 The TSV has a header row and 5 columns:
 
 ```
-commit	val_acc	memory_gb	status	description
+commit	val_mAP50	memory_gb	status	description
 ```
 
 1. git commit hash (short, 7 chars)
-2. val_acc achieved (e.g. 0.850000) — use 0.000000 for crashes
+2. val_mAP50 achieved (e.g. 0.450000) — use 0.000000 for crashes
 3. peak memory in GB, round to .1f (e.g. 2.0 — divide peak_vram_mb by 1024) — use 0.0 for crashes
 4. status: `keep`, `discard`, or `crash`
 5. short text description of what this experiment tried
@@ -96,11 +112,11 @@ commit	val_acc	memory_gb	status	description
 Example:
 
 ```
-commit	val_acc	memory_gb	status	description
-a1b2c3d	0.850000	2.0	keep	baseline MobileNetV2
-b2c3d4e	0.875000	2.1	keep	increase head LR to 3e-3
-c3d4e5f	0.840000	2.0	discard	switch to ResNet50 (worse)
-d4e5f6g	0.000000	0.0	crash	EfficientNet-B7 (OOM)
+commit	val_mAP50	memory_gb	status	description
+a1b2c3d	0.450000	2.0	keep	baseline YOLOv8s
+b2c3d4e	0.485000	2.1	keep	increase LR to 0.02
+c3d4e5f	0.440000	2.0	discard	switch to yolov8n (worse mAP)
+d4e5f6g	0.000000	0.0	crash	yolov8x (OOM on MPS)
 ```
 
 ## The experiment loop
@@ -112,12 +128,12 @@ LOOP FOREVER:
 1. Look at the git state: the current branch/commit we're on
 2. Tune `train.py` with an experimental idea by directly hacking the code.
 3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_acc:\|^peak_vram_mb:" run.log`
+4. Run the experiment: `python train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+5. Read out the results: `grep "^val_mAP50:\|^val_precision:\|^val_recall:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_acc improved (higher), you "advance" the branch, keeping the git commit
-9. If val_acc is equal or worse, you git reset back to where you started
+8. If val_mAP50 improved (higher), you "advance" the branch, keeping the git commit
+9. If val_mAP50 is equal or worse, you git reset back to where you started
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard.
 
@@ -126,16 +142,16 @@ The idea is that you are a completely autonomous researcher trying things out. I
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
 **Ideas to try** (non-exhaustive):
-- Different backbones: ResNet18/34/50, EfficientNet-B0/B1, ConvNeXt-Tiny, ViT-Small
-- Classifier head designs: add BatchNorm, change hidden dims, add SE attention
-- Progressive unfreezing: unfreeze more backbone layers over time
-- Data augmentation: CutMix, MixUp, RandAugment, AutoAugment
-- Learning rate: different schedules, warm restarts, different head/backbone LR ratios
-- Regularization: dropout rates, stochastic depth, weight decay tuning
-- Label smoothing values
-- Batch size tuning (trade off noise vs. updates per time budget)
-- Test Time Augmentation (TTA) during evaluation
-- Feature Pyramid or multi-scale feature fusion
-- Attention mechanisms in the classifier head (CBAM, SE, etc.)
+- Model sizes: yolov8n → yolov8s → yolov8m (test each for best mAP/speed tradeoff)
+- Learning rate tuning: try LR0 from 0.001 to 0.1
+- Augmentation: increase/decrease mosaic, try mixup, copy-paste, different HSV ranges
+- Batch size: 8, 16, 32 (trade off noise vs. updates per time budget)
+- Freeze backbone layers: freeze first N layers for better transfer learning
+- Loss weights: tune box/cls/dfl loss gains
+- Image size: try 640, 800, or 480
+- Multi-scale training
+- IoU/confidence thresholds tuning
+- Custom YOLO model configs (modify neck, head, anchors)
+- Different YOLO versions (YOLOv8 vs YOLOv5 if available)
 
 **NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. The human might be asleep. You are autonomous. The loop runs until the human interrupts you, period.
