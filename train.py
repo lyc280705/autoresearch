@@ -315,7 +315,8 @@ print(f"Training complete: {step} steps, {epoch} epochs, {total_training_time:.1
 # ---------------------------------------------------------------------------
 
 model.eval()
-results = evaluate(model, val_loader, device, num_classes=actual_num_classes)
+results = evaluate(model, val_loader, device, num_classes=actual_num_classes,
+                   class_names=train_dataset.classes)
 
 # Print summary
 t_end = time.time()

@@ -21,12 +21,10 @@ Users are encouraged to add their own photos for all 4 categories.
 import os
 import sys
 import time
-import math
 import shutil
 import zipfile
 import random
 import argparse
-from pathlib import Path
 
 import requests
 import numpy as np
@@ -253,9 +251,11 @@ class GarbageDataset(Dataset):
         if class_to_idx is not None:
             self.class_to_idx = class_to_idx
         else:
-            # Auto-detect classes from directory names, sorted for reproducibility
+            # Auto-detect classes from directory names, only include non-empty dirs
             classes = sorted(d for d in os.listdir(root_dir)
-                           if os.path.isdir(os.path.join(root_dir, d)))
+                           if os.path.isdir(os.path.join(root_dir, d))
+                           and any(f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))
+                                   for f in os.listdir(os.path.join(root_dir, d))))
             self.class_to_idx = {c: i for i, c in enumerate(classes)}
 
         self.classes = list(self.class_to_idx.keys())
@@ -378,7 +378,7 @@ def make_dataloader(split, batch_size, image_size=IMAGE_SIZE, data_dir=None,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model, data_loader, device, num_classes=None):
+def evaluate(model, data_loader, device, num_classes=None, class_names=None):
     """
     Evaluate model on a data loader.
 
@@ -421,7 +421,9 @@ def evaluate(model, data_loader, device, num_classes=None):
     active_classes = sorted(set(all_labels.tolist()))
     active_names = []
     for idx in active_classes:
-        if idx < len(CLASS_NAMES):
+        if class_names is not None and idx < len(class_names):
+            active_names.append(class_names[idx])
+        elif idx < len(CLASS_NAMES):
             active_names.append(f"{CLASS_NAMES[idx]}({CLASS_NAMES_EN[idx]})")
         else:
             active_names.append(f"class_{idx}")
@@ -432,10 +434,10 @@ def evaluate(model, data_loader, device, num_classes=None):
 
     # Per-class accuracy
     per_class_acc = {}
-    for idx in active_classes:
+    for i, idx in enumerate(active_classes):
         mask = all_labels == idx
         if mask.sum() > 0:
-            name = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else f"class_{idx}"
+            name = active_names[i]
             per_class_acc[name] = (all_preds[mask] == all_labels[mask]).mean()
 
     report = classification_report(
