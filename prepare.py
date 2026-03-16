@@ -360,6 +360,7 @@ def convert_taco_to_yolo(coco_data, images_dir, data_dir):
 
     # Convert and write YOLO format labels
     class_counts = defaultdict(lambda: defaultdict(int))
+    excluded_count = 0
 
     for split_name, split_ids in splits.items():
         split_img_dir = os.path.join(data_dir, split_name, "images")
@@ -385,6 +386,7 @@ def convert_taco_to_yolo(coco_data, images_dir, data_dir):
             for ann in anns_by_image[img_id]:
                 cat_id = ann["category_id"]
                 if cat_id not in taco_id_to_chinese:
+                    excluded_count += 1
                     continue  # skip excluded categories
                 chinese_id = taco_id_to_chinese[cat_id]
 
@@ -407,6 +409,8 @@ def convert_taco_to_yolo(coco_data, images_dir, data_dir):
                 f.write("\n".join(label_lines) + "\n" if label_lines else "")
 
     # Print statistics
+    if excluded_count > 0:
+        print(f"  Excluded {excluded_count} annotations from None-mapped categories")
     for split_name in ["train", "val", "test"]:
         total = sum(class_counts[split_name].values())
         print(f"  {split_name}: {len(splits[split_name])} images, {total} annotations")
