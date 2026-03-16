@@ -1,90 +1,148 @@
-# autoresearch
+# autoresearch — 垃圾目标检测 (Garbage Object Detection)
 
-![teaser](progress.png)
+基于YOLOv8的垃圾目标检测系统——识别一张图片中的**所有垃圾**并逐个分类，支持国内四分类标准（可回收物、有害垃圾、厨余垃圾、其他垃圾）。
 
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
+An autonomous computer vision research system for garbage **object detection**. Detects and classifies ALL garbage objects in a single image. An AI agent modifies the training code, trains for 5 minutes, checks if mAP improved, keeps or discards, and repeats.
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069).
+## 与图像分类的区别 (Difference from Classification)
+
+| | 图像分类 (Classification) | 目标检测 (Object Detection) |
+|---|---|---|
+| 输入 | 一张只含一个物体的图片 | 一张包含多个垃圾的照片 |
+| 输出 | 一个类别标签 | 每个垃圾的位置(边界框)+类别 |
+| 模型 | MobileNet, ResNet, etc. | **YOLOv8**, Faster R-CNN, etc. |
+| 数据集 | TrashNet (单物体) | **TACO** (多物体+标注框) |
+| 评价指标 | Accuracy | **mAP (Mean Average Precision)** |
+
+## 垃圾分类四类标准 (4-Category Standard)
+
+| 类别 | Category | 示例 Examples |
+|------|----------|--------------|
+| 可回收物 | Recyclable | 塑料瓶、玻璃瓶、金属罐、纸板、纸杯 |
+| 有害垃圾 | Hazardous | 电池、气雾罐、药品泡罩包装 |
+| 厨余垃圾 | Kitchen waste | 食物残渣、果皮 |
+| 其他垃圾 | Other waste | 烟头、破碎玻璃、一次性塑料制品、垃圾袋 |
+
+## 数据集 (Dataset)
+
+使用 **TACO (Trash Annotations in Context)** 数据集：
+- ~1500张真实场景图片，~5000个标注框
+- 60种细分垃圾类别 → 映射为4种国内分类
+- COCO格式标注 → 自动转换为YOLO格式
+- 每张图片可能包含多个垃圾目标
 
 ## How it works
 
-The repo is deliberately kept small and only really has three files that matter:
+The repo has four files that matter:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+- **`prepare.py`** — fixed constants, TACO data download + YOLO format conversion, and evaluation harness. Not modified by agent.
+- **`train.py`** — the single file the agent edits. YOLOv8 model config, hyperparameters, augmentation. **This file is edited and iterated on by the agent**.
+- **`predict.py`** — single-image inference script. Detects all garbage and shows results.
+- **`program.md`** — baseline instructions for the agent. **This file is edited and iterated on by the human**.
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
-
-If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+Training runs for a **fixed 5-minute time budget** (wall clock). The primary metric is **val_mAP50** (mean Average Precision at IoU=0.5) — higher is better.
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** Python 3.10+, conda environment with PyTorch
 
 ```bash
+# 1. Activate conda environment
+conda activate Pytorch
 
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# 2. Install additional dependencies
+pip install ultralytics
 
-# 2. Install dependencies
-uv sync
+# 3. Download TACO dataset and prepare YOLO format data (~5-15 min)
+python prepare.py
 
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
+# 4. Train the object detection model (~5 min)
+python train.py
 
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+# 5. Detect garbage in a photo
+python predict.py your_photo.jpg --save result.jpg
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+## Environment setup
+
+If creating a new conda environment from scratch:
+
+```bash
+conda env create -f environment.yml
+conda activate Pytorch
+```
+
+Or install into existing "Pytorch" environment:
+
+```bash
+conda activate Pytorch
+pip install ultralytics
+```
+
+## 拍照识别 (Photo Detection)
+
+Train the model, then detect garbage in any photo:
+
+```bash
+# Detect garbage in a photo and save annotated result
+python predict.py photo.jpg --save result.jpg
+
+# Adjust confidence threshold (lower = more detections)
+python predict.py photo.jpg --conf 0.15 --save result.jpg
+
+# Use a specific model checkpoint
+python predict.py photo.jpg --model runs/train/weights/best.pt --save result.jpg
+```
+
+The output shows:
+- Bounding boxes around each detected garbage item
+- Category labels (可回收物/有害垃圾/厨余垃圾/其他垃圾)
+- Confidence scores
+- Category summary (count per category)
 
 ## Running the agent
 
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+Spin up your Claude/Codex agent in this repo, then prompt:
 
 ```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
+Hi, have a look at program.md and let's kick off a new experiment! Let's do the setup first.
 ```
 
-The `program.md` file is essentially a super lightweight "skill".
+The agent will autonomously:
+1. Establish a baseline with YOLOv8s
+2. Try different model sizes (YOLOv8n/s/m)
+3. Experiment with hyperparameters, augmentation, loss weights
+4. Keep improvements, discard regressions
+5. Log all results to `results.tsv`
 
 ## Project structure
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
+prepare.py       — TACO data download, YOLO conversion, evaluation (do not modify)
+train.py         — YOLOv8 training config and hyperparameters (agent modifies this)
+predict.py       — single-image inference (detect all garbage in a photo)
+program.md       — agent instructions
+environment.yml  — conda environment specification
+pyproject.toml   — Python project metadata
 ```
 
 ## Design choices
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+- **Object detection, not classification.** Detects ALL garbage objects in one image, not just one label.
+- **TACO dataset.** Real-world images with bounding-box annotations, mapped to Chinese 4-category standard.
+- **YOLOv8 baseline.** State-of-the-art real-time object detection, supports MPS (Apple Silicon).
+- **Fixed time budget.** Training always runs for exactly 5 minutes. ~12 experiments/hour, ~100 overnight.
+- **Single file to modify.** The agent only touches `train.py`. Diffs are reviewable.
+- **conda + PyTorch.** Uses local conda environment named "Pytorch".
 
-## Platform support
+## Baseline model
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
-
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
-
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
-
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
-
-## Notable forks
-
-- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
-- [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
-- [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
+The default `train.py` uses:
+- **Model**: YOLOv8s (small) pretrained on COCO
+- **Image size**: 640×640
+- **Augmentation**: Mosaic, HSV, flip, scale
+- **Optimizer**: SGD with cosine schedule
+- **Time budget**: 5 minutes (using YOLO's built-in time parameter)
 
 ## License
 
