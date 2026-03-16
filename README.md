@@ -1,8 +1,8 @@
 # autoresearch — 垃圾目标检测 (Garbage Object Detection)
 
-基于YOLOv8的垃圾目标检测系统——识别一张图片中的**所有垃圾**并逐个分类，支持国内四分类标准（可回收物、有害垃圾、厨余垃圾、其他垃圾）。
+基于多种创新模型架构的垃圾目标检测系统——识别一张图片中的**所有垃圾**并逐个分类，支持国内四分类标准（可回收物、有害垃圾、厨余垃圾、其他垃圾）。
 
-An autonomous computer vision research system for garbage **object detection**. Detects and classifies ALL garbage objects in a single image. An AI agent modifies the training code, trains for 5 minutes, checks if mAP improved, keeps or discards, and repeats.
+An autonomous computer vision research system for garbage **object detection**. Supports **multiple innovative model architectures** (CNN-based YOLO variants, Transformer-based RT-DETR, ensemble methods) to detect and classify ALL garbage objects in a single image. An AI agent explores different architectures and training strategies, trains for 5 minutes, checks if mAP improved, keeps or discards, and repeats.
 
 ## 与图像分类的区别 (Difference from Classification)
 
@@ -10,7 +10,7 @@ An autonomous computer vision research system for garbage **object detection**. 
 |---|---|---|
 | 输入 | 一张只含一个物体的图片 | 一张包含多个垃圾的照片 |
 | 输出 | 一个类别标签 | 每个垃圾的位置(边界框)+类别 |
-| 模型 | MobileNet, ResNet, etc. | **YOLOv8**, Faster R-CNN, etc. |
+| 模型 | MobileNet, ResNet, etc. | **YOLOv8, RT-DETR, YOLOv9**, etc. |
 | 数据集 | TrashNet (单物体) | **TACO** (多物体+标注框) |
 | 评价指标 | Accuracy | **mAP (Mean Average Precision)** |
 
@@ -36,7 +36,7 @@ An autonomous computer vision research system for garbage **object detection**. 
 The repo has four files that matter:
 
 - **`prepare.py`** — fixed constants, TACO data download + YOLO format conversion, and evaluation harness. Not modified by agent.
-- **`train.py`** — the single file the agent edits. YOLOv8 model config, hyperparameters, augmentation. **This file is edited and iterated on by the agent**.
+- **`train.py`** — the single file the agent edits. Multi-architecture model config (YOLOv8, RT-DETR, YOLOv5, YOLO11, YOLOv9, YOLOv10), hyperparameters, augmentation, multi-phase training, ensemble evaluation. **This file is edited and iterated on by the agent**.
 - **`predict.py`** — single-image inference script. Detects all garbage and shows results.
 - **`program.md`** — baseline instructions for the agent. **This file is edited and iterated on by the human**.
 
@@ -110,16 +110,19 @@ Hi, have a look at program.md and let's kick off a new experiment! Let's do the 
 
 The agent will autonomously:
 1. Establish a baseline with YOLOv8s
-2. Try different model sizes (YOLOv8n/s/m)
-3. Experiment with hyperparameters, augmentation, loss weights
-4. Keep improvements, discard regressions
-5. Log all results to `results.tsv`
+2. Explore different model architectures (RT-DETR Transformer, YOLOv9, YOLOv10, YOLO11, YOLOv5)
+3. Try different model sizes within each architecture family
+4. Experiment with innovative training strategies (multi-phase freeze/unfreeze, AdamW)
+5. Tune hyperparameters, augmentation, and loss weights
+6. Compare CNN vs. Transformer approaches
+7. Keep improvements, discard regressions
+8. Log all results to `results.tsv`
 
 ## Project structure
 
 ```
 prepare.py       — TACO data download, YOLO conversion, evaluation (do not modify)
-train.py         — YOLOv8 training config and hyperparameters (agent modifies this)
+train.py         — Multi-architecture training config and hyperparameters (agent modifies this)
 predict.py       — single-image inference (detect all garbage in a photo)
 program.md       — agent instructions
 environment.yml  — conda environment specification
@@ -128,9 +131,10 @@ pyproject.toml   — Python project metadata
 
 ## Design choices
 
+- **Multiple architecture exploration.** CNN (YOLOv8/v5/v9/v10/v11) and Transformer (RT-DETR) models.
 - **Object detection, not classification.** Detects ALL garbage objects in one image, not just one label.
 - **TACO dataset.** Real-world images with bounding-box annotations, mapped to Chinese 4-category standard.
-- **YOLOv8 baseline.** State-of-the-art real-time object detection, supports MPS (Apple Silicon).
+- **Architecture-aware defaults.** Training config auto-adjusts for CNN vs Transformer models.
 - **Fixed time budget.** Training always runs for exactly 5 minutes. ~12 experiments/hour, ~100 overnight.
 - **Single file to modify.** The agent only touches `train.py`. Diffs are reviewable.
 - **conda + PyTorch.** Uses local conda environment named "Pytorch".
@@ -141,8 +145,19 @@ The default `train.py` uses:
 - **Model**: YOLOv8s (small) pretrained on COCO
 - **Image size**: 640×640
 - **Augmentation**: Mosaic, HSV, flip, scale
-- **Optimizer**: SGD with cosine schedule
+- **Optimizer**: SGD with cosine schedule (auto-switches to AdamW for Transformer models)
 - **Time budget**: 5 minutes (using YOLO's built-in time parameter)
+
+## Supported model architectures
+
+| Model | Type | Key Innovation | Recommended Sizes |
+|-------|------|---------------|-------------------|
+| YOLOv8 | CNN | Anchor-free, C2f modules | n, s, m |
+| YOLOv5 | CNN | CSPDarknet + PAN neck | nu, su, mu |
+| YOLOv9 | CNN | PGI + GELAN blocks | c, e |
+| YOLOv10 | CNN | NMS-free end-to-end | n, s, m, b |
+| YOLO11 | CNN | C3k2 + SPPF modules | n, s, m |
+| RT-DETR | Transformer | Hybrid CNN+Transformer encoder | l, x |
 
 ## License
 

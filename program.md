@@ -46,12 +46,18 @@ Each experiment runs on a single GPU (CUDA or MPS). The training script runs for
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game:
-  - Model size: `yolov8n.pt` (nano), `yolov8s.pt` (small), `yolov8m.pt` (medium), `yolov8l.pt` (large), `yolov8x.pt` (extra-large)
+  - **Model architecture** — switch between completely different model families:
+    - CNN-based: `yolov8n/s/m.pt`, `yolov5nu/su/mu.pt`, `yolo11n/s/m.pt`, `yolov9c/e.pt`, `yolov10n/s/m.pt`
+    - Transformer-based: `rtdetr-l.pt`, `rtdetr-x.pt` (hybrid CNN+Transformer encoder)
+    - Custom: write a `.yaml` config to define a custom YOLO architecture
+  - **Optimizer selection**: `OPTIMIZER = "auto"/"SGD"/"Adam"/"AdamW"/"RMSProp"`
   - Learning rate, momentum, weight decay, warmup settings
   - Augmentation parameters: mosaic, mixup, copy-paste, HSV, rotation, scale, etc.
   - Loss weights: box, cls, dfl gains
   - Batch size (trade off VRAM vs. training speed)
   - Freeze backbone layers (transfer learning strategy)
+  - **Multi-phase training**: `MULTI_PHASE_TRAINING = True` freezes backbone first, then fine-tunes
+  - **Ensemble evaluation**: `ENSEMBLE_EVAL = True` to evaluate multiple models together
   - Confidence and IoU thresholds for inference
   - Custom YOLO configuration (modify model architecture via YAML)
 
@@ -84,6 +90,7 @@ peak_vram_mb:     2048.0
 num_classes:      4
 batch_size:       16
 model:            yolov8s.pt
+model_family:     yolov8
 image_size:       640
 ```
 
@@ -113,10 +120,14 @@ Example:
 
 ```
 commit	val_mAP50	memory_gb	status	description
-a1b2c3d	0.450000	2.0	keep	baseline YOLOv8s
+a1b2c3d	0.450000	2.0	keep	baseline YOLOv8s (CNN)
 b2c3d4e	0.485000	2.1	keep	increase LR to 0.02
 c3d4e5f	0.440000	2.0	discard	switch to yolov8n (worse mAP)
 d4e5f6g	0.000000	0.0	crash	yolov8x (OOM on MPS)
+e5f6g7h	0.510000	3.5	keep	RT-DETR-l (Transformer) AdamW lr=0.0001
+f6g7h8i	0.495000	2.3	keep	YOLOv9c (PGI architecture)
+g7h8i9j	0.475000	2.0	discard	YOLO11s (latest arch — slightly worse)
+h8i9j0k	0.520000	2.5	keep	YOLOv8m + multi-phase freeze training
 ```
 
 ## The experiment loop
@@ -142,16 +153,39 @@ The idea is that you are a completely autonomous researcher trying things out. I
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
 **Ideas to try** (non-exhaustive):
-- Model sizes: yolov8n → yolov8s → yolov8m (test each for best mAP/speed tradeoff)
-- Learning rate tuning: try LR0 from 0.001 to 0.1
-- Augmentation: increase/decrease mosaic, try mixup, copy-paste, different HSV ranges
+
+**Architecture exploration (high impact):**
+- **RT-DETR** (Transformer-based): Set `MODEL_SIZE = "rtdetr-l.pt"` — hybrid CNN+Transformer, uses cross-attention, often higher mAP but slower
+- **YOLOv9** (PGI architecture): Set `MODEL_SIZE = "yolov9c.pt"` — Programmable Gradient Information + GELAN blocks
+- **YOLOv10** (NMS-free): Set `MODEL_SIZE = "yolov10s.pt"` — end-to-end detection without NMS post-processing
+- **YOLO11** (latest): Set `MODEL_SIZE = "yolo11s.pt"` — newest architecture with C3k2 blocks
+- **YOLOv5** (proven): Set `MODEL_SIZE = "yolov5su.pt"` — classic and well-tested baseline
+
+**Model size sweep (within each family):**
+- YOLOv8: n → s → m (test each for best mAP/speed tradeoff within time budget)
+- RT-DETR: l → x (larger Transformer for potentially higher accuracy)
+- YOLO11: n → s → m (latest architecture at different capacities)
+
+**Innovative training strategies:**
+- **Multi-phase training**: Set `MULTI_PHASE_TRAINING = True` — freeze backbone first, then unfreeze and fine-tune (transfer learning innovation)
+- **AdamW optimizer**: Set `OPTIMIZER = "AdamW"` with lower LR — especially beneficial for Transformer-based models
+- **Progressive fine-tuning**: Freeze 10 layers → train → unfreeze → train with lower LR
+
+**Hyperparameter tuning:**
+- Learning rate: LR0 from 0.001 to 0.1 (CNN) or 0.00001 to 0.001 (Transformer)
 - Batch size: 8, 16, 32 (trade off noise vs. updates per time budget)
-- Freeze backbone layers: freeze first N layers for better transfer learning
+- Augmentation: increase/decrease mosaic, try mixup, copy-paste, different HSV ranges
 - Loss weights: tune box/cls/dfl loss gains
-- Image size: try 640, 800, or 480
+- Image size: try 640, 800, or 480 (tradeoff between detail and speed)
 - Multi-scale training
-- IoU/confidence thresholds tuning
-- Custom YOLO model configs (modify neck, head, anchors)
-- Different YOLO versions (YOLOv8 vs YOLOv5 if available)
+
+**Ensemble methods:**
+- Train multiple architectures (e.g., YOLOv8 + RT-DETR), then set `ENSEMBLE_EVAL = True` with `ENSEMBLE_MODELS = ["path/to/model1.pt"]`
+- Compare CNN vs. Transformer performance on garbage detection
+
+**Transfer learning strategies:**
+- Freeze first N layers for better transfer from COCO pretrained weights
+- Different freeze depths for different model families
+- Multi-phase: heavy freeze → partial freeze → full fine-tune
 
 **NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. The human might be asleep. You are autonomous. The loop runs until the human interrupts you, period.
