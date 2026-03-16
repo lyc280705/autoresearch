@@ -35,8 +35,8 @@ An autonomous computer vision research system for garbage **object detection**. 
 
 The repo has four files that matter:
 
-- **`prepare.py`** — fixed constants, TACO data download + YOLO format conversion, and evaluation harness. Not modified by agent.
-- **`train.py`** — the single file the agent edits. Multi-architecture model config (YOLOv8, RT-DETR, YOLOv5, YOLO11, YOLOv9, YOLOv10), hyperparameters, augmentation, multi-phase training, ensemble evaluation. **This file is edited and iterated on by the agent**.
+- **`prepare.py`** — TACO data download + YOLO format conversion, category mapping, and evaluation harness. **Agent-editable** — the agent can innovate on data pipeline, category mapping refinements, and evaluation (must keep 4 classes and object detection).
+- **`train.py`** — Multi-architecture model config (YOLOv8, RT-DETR, YOLOv5, YOLO11, YOLOv9, YOLOv10), hyperparameters, augmentation, multi-phase training, ensemble evaluation. **Agent-editable** — the agent edits and iterates on this file.
 - **`predict.py`** — single-image inference script. Detects all garbage and shows results.
 - **`program.md`** — baseline instructions for the agent. **This file is edited and iterated on by the human**.
 
@@ -121,8 +121,8 @@ The agent will autonomously:
 ## Project structure
 
 ```
-prepare.py       — TACO data download, YOLO conversion, evaluation (do not modify)
-train.py         — Multi-architecture training config and hyperparameters (agent modifies this)
+prepare.py       — TACO data download, YOLO conversion, evaluation (agent-editable, keep 4 classes)
+train.py         — Multi-architecture training config and hyperparameters (agent-editable)
 predict.py       — single-image inference (detect all garbage in a photo)
 program.md       — agent instructions
 environment.yml  — conda environment specification
@@ -136,7 +136,8 @@ pyproject.toml   — Python project metadata
 - **TACO dataset.** Real-world images with bounding-box annotations, mapped to Chinese 4-category standard.
 - **Architecture-aware defaults.** Training config auto-adjusts for CNN vs Transformer models.
 - **Fixed time budget.** Training always runs for exactly 5 minutes. ~12 experiments/hour, ~100 overnight.
-- **Single file to modify.** The agent only touches `train.py`. Diffs are reviewable.
+- **Two files to modify.** The agent can edit both `train.py` (training) and `prepare.py` (data/eval).
+- **Paper-driven innovation.** The agent can search arxiv/Google Scholar for state-of-the-art techniques.
 - **conda + PyTorch.** Uses local conda environment named "Pytorch".
 
 ## Baseline model

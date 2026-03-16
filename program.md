@@ -10,8 +10,8 @@ To set up a new experiment, work with the user to:
 2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
 3. **Read the in-scope files**: The repo is small. Read these files for full context:
    - `README.md` — repository context.
-   - `prepare.py` — fixed constants, TACO data prep, YOLO format conversion, evaluation. Do not modify.
-   - `train.py` — the file you modify. YOLOv8 model configuration, hyperparameters, augmentation, training.
+   - `prepare.py` — data prep, TACO conversion, category mapping, evaluation. **Editable** — innovate on data pipeline (keep 4 classes, keep object detection).
+   - `train.py` — model architecture, hyperparameters, training strategy. **Editable** — innovate on training.
    - `predict.py` — single-image inference script. Usually no need to modify.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/data/train/images/` contains images. If not, tell the human to run `python prepare.py`.
 5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
@@ -45,7 +45,7 @@ conda activate Pytorch
 Each experiment runs on a single GPU (CUDA or MPS). The training script runs for a **fixed time budget of 5 minutes** (wall clock). You launch it simply as: `python train.py`.
 
 **What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game:
+- Modify `train.py` — model architecture, hyperparameters, training strategy:
   - **Model architecture** — switch between completely different model families:
     - CNN-based: `yolov8n/s/m.pt`, `yolov5nu/su/mu.pt`, `yolo11n/s/m.pt`, `yolov9c/e.pt`, `yolov10n/s/m.pt`
     - Transformer-based: `rtdetr-l.pt`, `rtdetr-x.pt` (hybrid CNN+Transformer encoder)
@@ -61,10 +61,20 @@ Each experiment runs on a single GPU (CUDA or MPS). The training script runs for
   - Confidence and IoU thresholds for inference
   - Custom YOLO configuration (modify model architecture via YAML)
 
+- Modify `prepare.py` — data pipeline, category mapping, evaluation:
+  - **Category mapping** (`TACO_NAME_TO_CHINESE`): reclassify ambiguous items between the 4 categories, or set a value to `None` to exclude noisy categories
+  - **Data splits** (`VAL_RATIO`, `TEST_RATIO`): adjust train/val/test proportions
+  - **Image size** (`IMAGE_SIZE`): try 480, 640, 800, 1024
+  - **Time budget** (`TIME_BUDGET`): adjust training time
+  - **Class weights** (`compute_class_weights()`): use for class-imbalanced training
+  - **Evaluation** (`evaluate()`): add TTA (`augment=True`), custom NMS thresholds
+  - **Data rebuild** (`rebuild_data()`): call after changing category mapping or splits
+  - **Dataset stats** (`get_dataset_stats()`): analyze class distribution before experiments
+
 **What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed data preparation, TACO category mapping, and evaluation harness.
+- Change `NUM_CLASSES` from 4 or rename the 4 Chinese waste categories.
+- Change the task from object detection to classification (must keep bounding boxes).
 - Install new packages or add dependencies beyond what's already available.
-- Modify the evaluation harness. The `evaluate` function in `prepare.py` is the ground truth metric.
 
 **The goal is simple: get the highest val_mAP50 (mean Average Precision at IoU=0.5).** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything else is fair game.
 
@@ -187,5 +197,51 @@ The idea is that you are a completely autonomous researcher trying things out. I
 - Freeze first N layers for better transfer from COCO pretrained weights
 - Different freeze depths for different model families
 - Multi-phase: heavy freeze → partial freeze → full fine-tune
+
+**Data-level innovations (modify prepare.py):**
+- **Category mapping refinement**: reclassify ambiguous TACO items between the 4 Chinese categories (e.g., move "Broken glass" from 其他 to 有害)
+- **Noise filtering**: set ambiguous TACO categories to `None` in `TACO_NAME_TO_CHINESE` to exclude them
+- **Class balance analysis**: call `get_dataset_stats()` to understand distribution, then use `compute_class_weights()` for class-weighted training
+- **Data split tuning**: try different `VAL_RATIO` (0.1 vs 0.2) to get more or less training data
+- **Higher resolution**: set `IMAGE_SIZE = 800` or `1024` for detecting small garbage objects
+- **Evaluation with TTA**: call `evaluate(..., augment=True)` for test-time augmentation
+- **Evaluation thresholds**: tune `conf` and `iou` in `evaluate()` to find better operating points
+- **Data rebuilding**: after changing `TACO_NAME_TO_CHINESE` mapping, call `rebuild_data()` to regenerate data
+
+## Searching papers for innovation
+
+When you hit a plateau or want to try a fundamentally new approach, **search for relevant research papers** to find state-of-the-art techniques. This gives you more diverse innovation ideas.
+
+**When to search papers:**
+- After 3–5 experiments with diminishing returns on the current approach
+- When a specific class has persistently low mAP (find targeted solutions)
+- When switching to a new model family (understand its strengths)
+- Before trying a novel technique (verify it's well-founded)
+
+**How to search:**
+- Use `web_fetch` to search arxiv, Google Scholar, or Papers With Code
+- Example queries: "garbage detection YOLO 2024", "waste classification deep learning", "small object detection augmentation", "class imbalanced object detection"
+- Look for: key hyperparameter settings, augmentation strategies, loss function innovations, architectural modifications
+
+**What to look for in papers:**
+- **Data augmentation innovations**: CutMix, GridMask, AutoAugment for detection tasks
+- **Loss function improvements**: Focal loss tuning, SIoU, WIoU, MPDIoU for better bbox regression
+- **Architecture modifications**: attention mechanisms (CBAM, SE, ECA), FPN variants
+- **Training strategies**: knowledge distillation, progressive resizing, SWA
+- **Class imbalance solutions**: oversampling, class-aware sampling, balanced GroupSoftmax
+- **Post-processing**: Soft-NMS, Weighted Boxes Fusion, learned NMS
+
+**How to apply findings:**
+- Modify `train.py` for model/training innovations
+- Modify `prepare.py` for data pipeline/evaluation innovations
+- Always compare against the current best result
+- Document the paper reference in the experiment description
+
+Example experiment descriptions referencing papers:
+```
+"Apply CopyPaste augmentation (Ghiasi et al., 2021) for rare classes"
+"Use AdamW + cosine decay (Loshchilov & Hutter, 2019) for Transformer model"
+"Add CBAM attention to YOLOv8 neck (Woo et al., 2018)"
+```
 
 **NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. The human might be asleep. You are autonomous. The loop runs until the human interrupts you, period.

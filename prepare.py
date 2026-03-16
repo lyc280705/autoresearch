@@ -1,5 +1,5 @@
 """
-One-time data preparation for garbage OBJECT DETECTION experiments.
+Data preparation for garbage OBJECT DETECTION experiments.
 Downloads the TACO (Trash Annotations in Context) dataset and converts it
 to YOLO format with 4 Chinese waste categories.
 
@@ -8,6 +8,16 @@ Usage:
     python prepare.py --data-dir PATH  # use custom data directory
 
 Data is stored in ~/.cache/autoresearch/.
+
+== AGENT-EDITABLE ==
+The agent CAN and SHOULD modify this file to explore data-level innovations
+such as augmentation pipeline, data filtering/cleaning, evaluation hooks,
+and the TACO→Chinese category mapping refinements.
+
+== HARD CONSTRAINTS (do NOT change) ==
+  - Always 4 Chinese waste categories (国内四分类)
+  - Always OBJECT DETECTION (bounding boxes, multiple objects per image)
+  - The evaluate() function must return val_mAP50 as the primary metric
 
 The 4 Chinese waste categories (国内四分类):
   0: 可回收物 (Recyclable)   — paper, clean plastics, glass, metal
@@ -36,24 +46,32 @@ from collections import defaultdict
 import requests
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Constants — HARD CONSTRAINTS (do NOT change NUM_CLASSES or CLASS_NAMES)
 # ---------------------------------------------------------------------------
 
-IMAGE_SIZE = 640          # YOLO input image resolution
-TIME_BUDGET = 300         # training time budget in seconds (5 minutes)
-NUM_CLASSES = 4           # 4 Chinese waste categories
-VAL_RATIO = 0.15          # fraction of data for validation
-TEST_RATIO = 0.10         # fraction of data for testing
-RANDOM_SEED = 42          # reproducible splits
-
-# Class names: Chinese 4-category garbage classification
+NUM_CLASSES = 4           # FIXED: 4 Chinese waste categories
 CLASS_NAMES = ["可回收物", "有害垃圾", "厨余垃圾", "其他垃圾"]
 CLASS_NAMES_EN = ["recyclable", "hazardous", "kitchen", "other"]
 
 # ---------------------------------------------------------------------------
+# Tunable constants — the agent may adjust these for experimentation
+# ---------------------------------------------------------------------------
+
+IMAGE_SIZE = 640          # YOLO input resolution (try 480, 640, 800, 1024)
+TIME_BUDGET = 300         # training time budget in seconds (5 minutes default)
+VAL_RATIO = 0.15          # fraction of data for validation (try 0.1–0.25)
+TEST_RATIO = 0.10         # fraction of data for testing
+RANDOM_SEED = 42          # reproducible splits (change to re-shuffle data)
+
+# ---------------------------------------------------------------------------
 # TACO category name → Chinese 4-category ID mapping
 #
-# Based on Chinese national waste sorting standard (GB/T 19095-2019):
+# The agent CAN refine this mapping to improve detection accuracy:
+#   - Reclassify ambiguous items (e.g., move "Broken glass" to 有害垃圾)
+#   - Set a value to None to EXCLUDE noisy/ambiguous categories entirely
+#   - Adjust the default for unmapped categories (currently 其他垃圾 = 3)
+#
+# CONSTRAINT: values must be 0, 1, 2, or 3 (or None to skip).
 #   0 可回收物: clean paper, plastic, glass, metal, fabric
 #   1 有害垃圾: batteries, aerosols, medicine, chemicals
 #   2 厨余垃圾: food waste, organic matter
@@ -287,14 +305,23 @@ def convert_taco_to_yolo(coco_data, images_dir, data_dir):
     # Build TACO category ID → Chinese 4-category mapping
     taco_id_to_chinese = {}
     unmapped = []
+    skipped = []
     for cat_id, cat_name in categories.items():
         if cat_name in TACO_NAME_TO_CHINESE:
-            taco_id_to_chinese[cat_id] = TACO_NAME_TO_CHINESE[cat_name]
+            mapped = TACO_NAME_TO_CHINESE[cat_name]
+            if mapped is None:
+                skipped.append(cat_name)
+            else:
+                taco_id_to_chinese[cat_id] = mapped
         else:
             unmapped.append(cat_name)
             # Default unmapped categories to "其他垃圾" (Other waste)
             taco_id_to_chinese[cat_id] = 3
 
+    if skipped:
+        print(f"  Note: {len(skipped)} categories explicitly excluded:")
+        for name in skipped:
+            print(f"    - {name}")
     if unmapped:
         print(f"  Note: {len(unmapped)} categories not in mapping (defaulted to 其他垃圾):")
         for name in unmapped:
@@ -357,7 +384,9 @@ def convert_taco_to_yolo(coco_data, images_dir, data_dir):
 
             for ann in anns_by_image[img_id]:
                 cat_id = ann["category_id"]
-                chinese_id = taco_id_to_chinese.get(cat_id, 3)
+                if cat_id not in taco_id_to_chinese:
+                    continue  # skip excluded categories
+                chinese_id = taco_id_to_chinese[cat_id]
 
                 # COCO bbox: [x_min, y_min, width, height] in pixels
                 bx, by, bw, bh = ann["bbox"]
@@ -467,10 +496,18 @@ def download_and_prepare(data_dir=None):
 
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric for object detection)
+# Evaluation
 # ---------------------------------------------------------------------------
+# The agent CAN extend evaluate() with additional techniques:
+#   - Test-Time Augmentation (TTA): set augment=True for higher mAP
+#   - Custom confidence/IoU thresholds for evaluation
+#   - Per-class analysis to identify weakest categories
+#
+# HARD CONSTRAINT: evaluate() must always return val_mAP50 as the primary
+# metric. The 4-class object detection task must remain unchanged.
 
-def evaluate(model, data_yaml, device=None):
+def evaluate(model, data_yaml, device=None, augment=False, conf=0.001,
+             iou=0.6):
     """
     Evaluate object detection model using ultralytics YOLO val().
 
@@ -478,6 +515,9 @@ def evaluate(model, data_yaml, device=None):
         model: ultralytics YOLO model (or path to .pt weights)
         data_yaml: path to data.yaml
         device: device string ("cuda", "mps", "cpu", or None for auto)
+        augment: if True, use test-time augmentation (TTA)
+        conf: confidence threshold for evaluation (lower → higher recall)
+        iou: IoU threshold for NMS during evaluation
 
     Returns dict with:
         val_mAP50:     mAP at IoU=0.5 (primary metric, higher is better)
@@ -494,6 +534,12 @@ def evaluate(model, data_yaml, device=None):
     kwargs = {"data": data_yaml, "verbose": False}
     if device is not None:
         kwargs["device"] = device
+    if augment:
+        kwargs["augment"] = True
+    if abs(conf - 0.001) > 1e-9:
+        kwargs["conf"] = conf
+    if abs(iou - 0.6) > 1e-9:
+        kwargs["iou"] = iou
 
     results = model.val(**kwargs)
 
@@ -513,6 +559,122 @@ def evaluate(model, data_yaml, device=None):
     metrics["per_class_mAP50"] = per_class
 
     return metrics
+
+
+# ---------------------------------------------------------------------------
+# Utility functions for agent innovation
+# ---------------------------------------------------------------------------
+
+def compute_class_weights(data_dir=None):
+    """
+    Compute inverse-frequency class weights for imbalanced data.
+
+    Useful for the agent to apply class-weighted loss during training,
+    which helps improve mAP on underrepresented classes (e.g., 有害垃圾,
+    厨余垃圾 often have very few samples).
+
+    Returns:
+        dict: {class_id: weight} normalized so max weight = 1.0
+    """
+    if data_dir is None:
+        data_dir = DATA_DIR
+    label_dir = os.path.join(data_dir, "train", "labels")
+    if not os.path.isdir(label_dir):
+        return {i: 1.0 for i in range(NUM_CLASSES)}
+
+    counts = defaultdict(int)
+    for fname in os.listdir(label_dir):
+        if not fname.endswith(".txt"):
+            continue
+        with open(os.path.join(label_dir, fname)) as f:
+            for line in f:
+                parts = line.strip().split()
+                if parts:
+                    cls_id = int(parts[0])
+                    counts[cls_id] += 1
+
+    if not counts:
+        return {i: 1.0 for i in range(NUM_CLASSES)}
+
+    total = sum(counts.values())
+    weights = {}
+    for i in range(NUM_CLASSES):
+        c = counts.get(i, 1)
+        weights[i] = total / (NUM_CLASSES * c)
+
+    # Normalize so max weight = 1.0
+    max_w = max(weights.values())
+    return {k: v / max_w for k, v in weights.items()}
+
+
+def get_dataset_stats(data_dir=None):
+    """
+    Get detailed dataset statistics for analysis.
+
+    Returns dict with per-split, per-class annotation counts.
+    Useful for the agent to understand data distribution before making
+    decisions about category mapping, augmentation, or sampling strategies.
+    """
+    if data_dir is None:
+        data_dir = DATA_DIR
+
+    stats = {}
+    for split in ["train", "val", "test"]:
+        img_dir = os.path.join(data_dir, split, "images")
+        lbl_dir = os.path.join(data_dir, split, "labels")
+        if not os.path.isdir(img_dir):
+            continue
+
+        n_imgs = len([f for f in os.listdir(img_dir)
+                      if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+
+        class_counts = defaultdict(int)
+        total_boxes = 0
+        if os.path.isdir(lbl_dir):
+            for fname in os.listdir(lbl_dir):
+                if not fname.endswith(".txt"):
+                    continue
+                with open(os.path.join(lbl_dir, fname)) as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if parts:
+                            cls_id = int(parts[0])
+                            class_counts[cls_id] += 1
+                            total_boxes += 1
+
+        stats[split] = {
+            "images": n_imgs,
+            "total_boxes": total_boxes,
+            "class_counts": dict(class_counts),
+        }
+
+    return stats
+
+
+def rebuild_data(data_dir=None):
+    """
+    Re-run the data conversion pipeline after modifying TACO_NAME_TO_CHINESE
+    or split ratios.
+
+    Clears existing YOLO-format data and regenerates from cached TACO
+    annotations. Does NOT re-download images.
+    """
+    if data_dir is None:
+        data_dir = DATA_DIR
+
+    # Remove existing YOLO-format data
+    for split in ["train", "val", "test"]:
+        split_dir = os.path.join(data_dir, split)
+        if os.path.isdir(split_dir):
+            shutil.rmtree(split_dir)
+
+    # Remove data.yaml so download_and_prepare will regenerate
+    yaml_path = os.path.join(data_dir, "data.yaml")
+    if os.path.exists(yaml_path):
+        os.remove(yaml_path)
+
+    # Re-prepare from cached annotations and images
+    return download_and_prepare(data_dir)
 
 
 # ---------------------------------------------------------------------------
