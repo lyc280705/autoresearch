@@ -119,7 +119,7 @@ TACO_NAME_TO_CHINESE = {
     "Disposable food container": 3,
     "Foam food container": 3,
     "Other plastic container": 3,
-    "Plastic glooves": 3,
+    "Plastic glooves": 3,  # [sic] typo in TACO dataset, must match exactly
     "Plastic utensils": 3,
     "Rope & strings": 3,
     "Shoe": 3,

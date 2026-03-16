@@ -100,7 +100,7 @@ model = YOLO(MODEL_SIZE)
 results = model.train(
     data=data_yaml,
     epochs=200,                        # max epochs (time budget will stop earlier)
-    time=TIME_BUDGET / 3600,           # time limit in hours (5 min = 0.0833h)
+    time=TIME_BUDGET / 3600,           # time limit in hours (5 min ≈ 0.083h)
     imgsz=IMAGE_SIZE,
     batch=BATCH_SIZE,
     device=device,
