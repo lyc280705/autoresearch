@@ -217,15 +217,16 @@ def build_training_args(model_family, data_yaml, device):
 
     if model_family == "rtdetr":
         # RT-DETR: Transformer-based — needs AdamW, lower LR, no mosaic
-        if LR0 == 0.01:
+        # Use tolerance-based comparison to detect unchanged defaults
+        if abs(LR0 - 0.01) < 1e-9:
             args["lr0"] = 0.0001
         if OPTIMIZER == "auto":
             args["optimizer"] = "AdamW"
         else:
             args["optimizer"] = OPTIMIZER
-        if WEIGHT_DECAY == 0.0005:
+        if abs(WEIGHT_DECAY - 0.0005) < 1e-9:
             args["weight_decay"] = 0.0001
-        if MOSAIC == 1.0:
+        if abs(MOSAIC - 1.0) < 1e-9:
             args["mosaic"] = 0.0
     else:
         # CNN-based detectors (YOLOv8, v5, v9, v10, v11)
