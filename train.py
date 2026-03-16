@@ -218,7 +218,8 @@ model.train()
 while True:
     epoch += 1
     for images, labels in train_loader:
-        torch.cuda.synchronize() if device.type == "cuda" else None
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         t0 = time.time()
 
         images = images.to(device, non_blocking=True)
@@ -267,7 +268,7 @@ while True:
             total_training_time += dt
 
         # Update learning rate
-        progress = min(total_training_time / TIME_BUDGET, 1.0) if TIME_BUDGET > 0 else 0.0
+        progress = min(total_training_time / TIME_BUDGET, 1.0)
         lrm = get_lr_multiplier(progress)
         for group in optimizer.param_groups:
             if "initial_lr" not in group:

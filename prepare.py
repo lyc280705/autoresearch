@@ -286,7 +286,8 @@ class GarbageDataset(Dataset):
     def get_class_weights(self):
         """Compute inverse-frequency class weights for balanced training."""
         counts = np.bincount(self.targets, minlength=len(self.class_to_idx))
-        # Avoid division by zero for classes with no data
+        # Use max(count, 1) to avoid division by zero for any empty classes
+        # (empty classes get a weight but won't affect training since they have no samples)
         counts = np.maximum(counts, 1)
         weights = 1.0 / counts.astype(np.float64)
         weights = weights / weights.sum() * len(self.class_to_idx)
@@ -314,6 +315,8 @@ def get_train_transform(image_size=IMAGE_SIZE):
 def get_val_transform(image_size=IMAGE_SIZE):
     """Validation/test transform (no augmentation)."""
     return transforms.Compose([
+        # Resize to ~1.14x the crop size (standard practice to preserve content
+        # when center-cropping; 256/224 ≈ 1.14)
         transforms.Resize(int(image_size * 1.14)),
         transforms.CenterCrop(image_size),
         transforms.ToTensor(),
