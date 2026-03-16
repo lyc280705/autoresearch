@@ -1,134 +1,35 @@
 """
-One-time data preparation for garbage OBJECT DETECTION experiments.
-Downloads the TACO (Trash Annotations in Context) dataset and converts it
-to YOLO format with 4 Chinese waste categories.
+One-time data preparation for autoresearch experiments.
+Downloads data shards and trains a BPE tokenizer.
 
 Usage:
-    python prepare.py                  # full prep (download + organize)
-    python prepare.py --data-dir PATH  # use custom data directory
+    python prepare.py                  # full prep (download + tokenizer)
+    python prepare.py --num-shards 8   # download only 8 shards (for testing)
 
-Data is stored in ~/.cache/autoresearch/.
-
-The 4 Chinese waste categories (国内四分类):
-  0: 可回收物 (Recyclable)   — paper, clean plastics, glass, metal
-  1: 有害垃圾 (Hazardous)    — batteries, aerosols, medicine packaging
-  2: 厨余垃圾 (Kitchen waste) — food scraps, fruit peels
-  3: 其他垃圾 (Other waste)   — contaminated items, cigarettes, mixed waste
-
-Dataset: TACO (Trash Annotations in Context)
-  - ~1500 images with ~5000 bounding-box annotations
-  - 60 fine-grained categories mapped to 4 Chinese categories
-  - Real-world scenes with MULTIPLE garbage items per image
-  - COCO-format annotations converted to YOLO format
+Data and tokenizer are stored in ~/.cache/autoresearch/.
 """
 
 import os
 import sys
-import json
 import time
-import shutil
-import zipfile
-import random
+import math
 import argparse
-import concurrent.futures
-from collections import defaultdict
+import pickle
+from multiprocessing import Pool
 
 import requests
+import pyarrow.parquet as pq
+import rustbpe
+import tiktoken
+import torch
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-IMAGE_SIZE = 640          # YOLO input image resolution
-TIME_BUDGET = 300         # training time budget in seconds (5 minutes)
-NUM_CLASSES = 4           # 4 Chinese waste categories
-VAL_RATIO = 0.15          # fraction of data for validation
-TEST_RATIO = 0.10         # fraction of data for testing
-RANDOM_SEED = 42          # reproducible splits
-
-# Class names: Chinese 4-category garbage classification
-CLASS_NAMES = ["可回收物", "有害垃圾", "厨余垃圾", "其他垃圾"]
-CLASS_NAMES_EN = ["recyclable", "hazardous", "kitchen", "other"]
-
-# ---------------------------------------------------------------------------
-# TACO category name → Chinese 4-category ID mapping
-#
-# Based on Chinese national waste sorting standard (GB/T 19095-2019):
-#   0 可回收物: clean paper, plastic, glass, metal, fabric
-#   1 有害垃圾: batteries, aerosols, medicine, chemicals
-#   2 厨余垃圾: food waste, organic matter
-#   3 其他垃圾: contaminated items, mixed waste, non-recyclable
-# ---------------------------------------------------------------------------
-
-TACO_NAME_TO_CHINESE = {
-    # 0: 可回收物 (Recyclable) — clean recyclable materials
-    "Aluminium foil": 0,
-    "Other plastic bottle": 0,
-    "Clear plastic bottle": 0,
-    "Glass bottle": 0,
-    "Plastic bottle cap": 0,
-    "Metal bottle cap": 0,
-    "Food Can": 0,
-    "Drink can": 0,
-    "Toilet tube": 0,
-    "Other carton": 0,
-    "Egg carton": 0,
-    "Drink carton": 0,
-    "Corrugated carton": 0,
-    "Meal carton": 0,
-    "Pizza box": 0,
-    "Paper cup": 0,
-    "Glass cup": 0,
-    "Glass jar": 0,
-    "Plastic lid": 0,
-    "Metal lid": 0,
-    "Magazine paper": 0,
-    "Wrapping paper": 0,
-    "Normal paper": 0,
-    "Paper bag": 0,
-    "Spread tub": 0,
-    "Tupperware": 0,
-    "Pop tab": 0,
-    "Scrap metal": 0,
-    "Paper straw": 0,
-
-    # 1: 有害垃圾 (Hazardous) — dangerous / chemical waste
-    "Battery": 1,
-    "Aluminium blister pack": 1,
-    "Carded blister pack": 1,
-    "Aerosol": 1,
-
-    # 2: 厨余垃圾 (Kitchen waste) — food / organic waste
-    "Food waste": 2,
-
-    # 3: 其他垃圾 (Other waste) — contaminated / non-recyclable
-    "Broken glass": 3,
-    "Disposable plastic cup": 3,
-    "Foam cup": 3,
-    "Other plastic cup": 3,
-    "Other plastic": 3,
-    "Tissues": 3,
-    "Plastified paper bag": 3,
-    "Plastic Film": 3,
-    "Six pack rings": 3,
-    "Garbage bag": 3,
-    "Other plastic wrapper": 3,
-    "Single-use carrier bag": 3,
-    "Polypropylene bag": 3,
-    "Crisp packet": 3,
-    "Disposable food container": 3,
-    "Foam food container": 3,
-    "Other plastic container": 3,
-    "Plastic glooves": 3,  # [sic] typo in TACO dataset, must match exactly
-    "Plastic utensils": 3,
-    "Rope & strings": 3,
-    "Shoe": 3,
-    "Squeezable tube": 3,
-    "Plastic straw": 3,
-    "Styrofoam piece": 3,
-    "Unlabeled litter": 3,
-    "Cigarette": 3,
-}
+MAX_SEQ_LEN = 2048       # context length
+TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
+EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -136,41 +37,46 @@ TACO_NAME_TO_CHINESE = {
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
+TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
+BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
+MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
+VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
+VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
+VOCAB_SIZE = 8192
 
-# TACO repository zip (contains annotations.json)
-TACO_ZIP_URL = "https://github.com/pedropro/TACO/archive/refs/heads/master.zip"
+# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
+SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+
+SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
+BOS_TOKEN = "<|reserved_0|>"
 
 # ---------------------------------------------------------------------------
-# Data download helpers
+# Data download
 # ---------------------------------------------------------------------------
 
-def download_file(url, filepath, max_attempts=5, timeout=120):
-    """Download a file with retries. Returns True on success."""
+def download_single_shard(index):
+    """Download one parquet shard with retries. Returns True on success."""
+    filename = f"shard_{index:05d}.parquet"
+    filepath = os.path.join(DATA_DIR, filename)
     if os.path.exists(filepath):
         return True
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    url = f"{BASE_URL}/{filename}"
+    max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         try:
-            print(f"  Downloading (attempt {attempt}/{max_attempts})...")
-            response = requests.get(url, stream=True, timeout=timeout, allow_redirects=True)
+            response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
             temp_path = filepath + ".tmp"
-            total = int(response.headers.get("content-length", 0))
-            downloaded = 0
             with open(temp_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            pct = 100 * downloaded / total
-                            print(f"\r  Progress: {pct:.1f}% ({downloaded // 1024 // 1024}MB)",
-                                  end="", flush=True)
-            print()
             os.rename(temp_path, filepath)
+            print(f"  Downloaded {filename}")
             return True
         except (requests.RequestException, IOError) as e:
-            print(f"\n  Attempt {attempt}/{max_attempts} failed: {e}")
+            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
             for path in [filepath + ".tmp", filepath]:
                 if os.path.exists(path):
                     try:
@@ -182,374 +88,302 @@ def download_file(url, filepath, max_attempts=5, timeout=120):
     return False
 
 
-def _download_single_image(args):
-    """Download one image. Returns (image_id, filepath, success)."""
-    image_id, url, filepath = args
-    if os.path.exists(filepath):
-        return image_id, filepath, True
-    try:
-        resp = requests.get(url, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "wb") as f:
-            f.write(resp.content)
-        return image_id, filepath, True
-    except (requests.RequestException, IOError):
-        return image_id, filepath, False
+def download_data(num_shards, download_workers=8):
+    """Download training shards + pinned validation shard."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    num_train = min(num_shards, MAX_SHARD)
+    ids = list(range(num_train))
+    if VAL_SHARD not in ids:
+        ids.append(VAL_SHARD)
 
-
-# ---------------------------------------------------------------------------
-# TACO dataset download and conversion
-# ---------------------------------------------------------------------------
-
-def download_taco_annotations(cache_dir):
-    """Download TACO repo zip and extract annotations.json."""
-    ann_path = os.path.join(cache_dir, "taco_annotations.json")
-    if os.path.exists(ann_path):
-        print("TACO annotations: already downloaded")
-        return ann_path
-
-    # Download the TACO repo zip
-    zip_path = os.path.join(cache_dir, "taco-master.zip")
-    print("Downloading TACO repository...")
-    if not download_file(TACO_ZIP_URL, zip_path, max_attempts=3, timeout=120):
-        print("\nError: Failed to download TACO repository.")
-        print("You can manually download from:")
-        print(f"  {TACO_ZIP_URL}")
-        print(f"And place the zip at: {zip_path}")
-        sys.exit(1)
-
-    # Extract annotations.json from the zip
-    print("Extracting annotations...")
-    with zipfile.ZipFile(zip_path, "r") as z:
-        # Find annotations.json in the zip
-        ann_names = [n for n in z.namelist() if n.endswith("annotations.json")]
-        if not ann_names:
-            print("Error: annotations.json not found in TACO zip")
-            sys.exit(1)
-        with z.open(ann_names[0]) as src, open(ann_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-
-    print(f"Extracted annotations to: {ann_path}")
-    return ann_path
-
-
-def download_taco_images(coco_data, images_dir, max_workers=8):
-    """Download TACO images from Flickr URLs in parallel."""
-    images = {img["id"]: img for img in coco_data["images"]}
-
-    # Build download task list
-    tasks = []
-    for img_id, img_info in images.items():
-        url = img_info.get("flickr_url") or img_info.get("coco_url", "")
-        if not url:
-            continue
-        ext = os.path.splitext(img_info.get("file_name", ""))[1] or ".jpg"
-        filepath = os.path.join(images_dir, f"{img_id}{ext}")
-        tasks.append((img_id, url, filepath))
-
-    # Count already downloaded
-    already = sum(1 for _, _, fp in tasks if os.path.exists(fp))
-    remaining = len(tasks) - already
-    if remaining == 0:
-        print(f"TACO images: all {already} images already downloaded")
+    # Count what's already downloaded
+    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
+    if existing == len(ids):
+        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
         return
 
-    print(f"Downloading TACO images: {remaining} remaining ({already} already cached)...")
+    needed = len(ids) - existing
+    print(f"Data: downloading {needed} shards ({existing} already exist)...")
 
-    success = already
-    failed = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_download_single_image, t) for t in tasks
-                   if not os.path.exists(t[2])]
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            _, _, ok = future.result()
-            if ok:
-                success += 1
-            else:
-                failed += 1
-            done = i + 1
-            if done % 100 == 0 or done == len(futures):
-                print(f"  Progress: {done}/{len(futures)} "
-                      f"(total success: {success}, failed: {failed})")
+    workers = max(1, min(download_workers, needed))
+    with Pool(processes=workers) as pool:
+        results = pool.map(download_single_shard, ids)
 
-    print(f"Download complete: {success} images available, {failed} failed")
-    if success < 200:
-        print("Warning: fewer than 200 images available. Model quality may be limited.")
-        print("Consider manually adding garbage images to the dataset.")
+    ok = sum(1 for r in results if r)
+    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+
+# ---------------------------------------------------------------------------
+# Tokenizer training
+# ---------------------------------------------------------------------------
+
+def list_parquet_files():
+    """Return sorted list of parquet file paths in the data directory."""
+    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
+    return [os.path.join(DATA_DIR, f) for f in files]
 
 
-def convert_taco_to_yolo(coco_data, images_dir, data_dir):
-    """Convert TACO COCO annotations to YOLO format with 4-category mapping."""
-    images = {img["id"]: img for img in coco_data["images"]}
-    categories = {cat["id"]: cat["name"] for cat in coco_data["categories"]}
-
-    # Build TACO category ID → Chinese 4-category mapping
-    taco_id_to_chinese = {}
-    unmapped = []
-    for cat_id, cat_name in categories.items():
-        if cat_name in TACO_NAME_TO_CHINESE:
-            taco_id_to_chinese[cat_id] = TACO_NAME_TO_CHINESE[cat_name]
-        else:
-            unmapped.append(cat_name)
-            # Default unmapped categories to "其他垃圾" (Other waste)
-            taco_id_to_chinese[cat_id] = 3
-
-    if unmapped:
-        print(f"  Note: {len(unmapped)} categories not in mapping (defaulted to 其他垃圾):")
-        for name in unmapped:
-            print(f"    - {name}")
-
-    # Group annotations by image
-    anns_by_image = defaultdict(list)
-    for ann in coco_data["annotations"]:
-        anns_by_image[ann["image_id"]].append(ann)
-
-    # Filter to images that exist on disk and have annotations
-    valid_ids = []
-    for img_id, img_info in images.items():
-        if img_id not in anns_by_image:
-            continue
-        ext = os.path.splitext(img_info.get("file_name", ""))[1] or ".jpg"
-        filepath = os.path.join(images_dir, f"{img_id}{ext}")
-        if os.path.exists(filepath):
-            valid_ids.append(img_id)
-
-    print(f"  Valid images with annotations: {len(valid_ids)}")
-
-    # Split into train/val/test
-    random.seed(RANDOM_SEED)
-    random.shuffle(valid_ids)
-    n = len(valid_ids)
-    n_test = max(1, int(n * TEST_RATIO))
-    n_val = max(1, int(n * VAL_RATIO))
-    n_train = n - n_val - n_test
-
-    splits = {
-        "train": valid_ids[:n_train],
-        "val": valid_ids[n_train:n_train + n_val],
-        "test": valid_ids[n_train + n_val:],
-    }
-
-    # Convert and write YOLO format labels
-    class_counts = defaultdict(lambda: defaultdict(int))
-
-    for split_name, split_ids in splits.items():
-        split_img_dir = os.path.join(data_dir, split_name, "images")
-        split_lbl_dir = os.path.join(data_dir, split_name, "labels")
-        os.makedirs(split_img_dir, exist_ok=True)
-        os.makedirs(split_lbl_dir, exist_ok=True)
-
-        for img_id in split_ids:
-            img_info = images[img_id]
-            ext = os.path.splitext(img_info.get("file_name", ""))[1] or ".jpg"
-            src_path = os.path.join(images_dir, f"{img_id}{ext}")
-
-            # Copy image to split directory
-            dst_img = os.path.join(split_img_dir, f"{img_id}{ext}")
-            if not os.path.exists(dst_img):
-                shutil.copy2(src_path, dst_img)
-
-            # Convert annotations to YOLO format
-            img_w = img_info["width"]
-            img_h = img_info["height"]
-            label_lines = []
-
-            for ann in anns_by_image[img_id]:
-                cat_id = ann["category_id"]
-                chinese_id = taco_id_to_chinese.get(cat_id, 3)
-
-                # COCO bbox: [x_min, y_min, width, height] in pixels
-                bx, by, bw, bh = ann["bbox"]
-                # YOLO bbox: [x_center, y_center, width, height] normalized to 0-1
-                x_center = min(max((bx + bw / 2) / img_w, 0.0), 1.0)
-                y_center = min(max((by + bh / 2) / img_h, 0.0), 1.0)
-                w_norm = min(max(bw / img_w, 0.001), 1.0)
-                h_norm = min(max(bh / img_h, 0.001), 1.0)
-
-                label_lines.append(
-                    f"{chinese_id} {x_center:.6f} {y_center:.6f} {w_norm:.6f} {h_norm:.6f}"
-                )
-                class_counts[split_name][chinese_id] += 1
-
-            stem = os.path.splitext(f"{img_id}{ext}")[0]
-            label_path = os.path.join(split_lbl_dir, f"{stem}.txt")
-            with open(label_path, "w") as f:
-                f.write("\n".join(label_lines) + "\n" if label_lines else "")
-
-    # Print statistics
-    for split_name in ["train", "val", "test"]:
-        total = sum(class_counts[split_name].values())
-        print(f"  {split_name}: {len(splits[split_name])} images, {total} annotations")
-        for cls_id in range(NUM_CLASSES):
-            count = class_counts[split_name].get(cls_id, 0)
-            print(f"    {CLASS_NAMES[cls_id]} ({CLASS_NAMES_EN[cls_id]}): {count}")
-
-    return splits
+def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
+    """Yield documents from training split (all shards except pinned val shard)."""
+    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
+    nchars = 0
+    for filepath in parquet_paths:
+        pf = pq.ParquetFile(filepath)
+        for rg_idx in range(pf.num_row_groups):
+            rg = pf.read_row_group(rg_idx)
+            for text in rg.column("text").to_pylist():
+                doc = text[:doc_cap] if len(text) > doc_cap else text
+                nchars += len(doc)
+                yield doc
+                if nchars >= max_chars:
+                    return
 
 
-def create_data_yaml(data_dir):
-    """Create YOLO data.yaml configuration file."""
-    yaml_path = os.path.join(data_dir, "data.yaml")
-    content = (
-        f"# YOLO data config — garbage detection (4-category Chinese waste sorting)\n"
-        f"path: {data_dir}\n"
-        f"train: train/images\n"
-        f"val: val/images\n"
-        f"test: test/images\n"
-        f"\n"
-        f"nc: {NUM_CLASSES}\n"
-        f"names:\n"
-        f"  0: recyclable\n"
-        f"  1: hazardous\n"
-        f"  2: kitchen\n"
-        f"  3: other\n"
-        f"\n"
-        f"# Chinese names:\n"
-        f"# 0: 可回收物  1: 有害垃圾  2: 厨余垃圾  3: 其他垃圾\n"
+def train_tokenizer():
+    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
+    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
+    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+
+    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
+        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
+        return
+
+    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+
+    parquet_files = list_parquet_files()
+    if len(parquet_files) < 2:
+        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
+        sys.exit(1)
+
+    # --- Train with rustbpe ---
+    print("Tokenizer: training BPE tokenizer...")
+    t0 = time.time()
+
+    tokenizer = rustbpe.Tokenizer()
+    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
+    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+
+    # Build tiktoken encoding from trained merges
+    pattern = tokenizer.get_pattern()
+    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
+    tokens_offset = len(mergeable_ranks)
+    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
+    enc = tiktoken.Encoding(
+        name="rustbpe",
+        pat_str=pattern,
+        mergeable_ranks=mergeable_ranks,
+        special_tokens=special_tokens,
     )
-    with open(yaml_path, "w") as f:
-        f.write(content)
-    print(f"Created data config: {yaml_path}")
-    return yaml_path
 
+    # Save tokenizer
+    with open(tokenizer_pkl, "wb") as f:
+        pickle.dump(enc, f)
 
-def get_data_yaml_path(data_dir=None):
-    """Return the path to data.yaml (convenience helper for train.py)."""
-    if data_dir is None:
-        data_dir = DATA_DIR
-    return os.path.join(data_dir, "data.yaml")
+    t1 = time.time()
+    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
 
+    # --- Build token_bytes lookup for BPB evaluation ---
+    print("Tokenizer: building token_bytes lookup...")
+    special_set = set(SPECIAL_TOKENS)
+    token_bytes_list = []
+    for token_id in range(enc.n_vocab):
+        token_str = enc.decode([token_id])
+        if token_str in special_set:
+            token_bytes_list.append(0)
+        else:
+            token_bytes_list.append(len(token_str.encode("utf-8")))
+    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
+    torch.save(token_bytes_tensor, token_bytes_path)
+    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
 
-# ---------------------------------------------------------------------------
-# Main download-and-prepare pipeline
-# ---------------------------------------------------------------------------
-
-def download_and_prepare(data_dir=None):
-    """Download TACO dataset and prepare YOLO-format data."""
-    if data_dir is None:
-        data_dir = DATA_DIR
-
-    yaml_path = os.path.join(data_dir, "data.yaml")
-
-    # Skip if already prepared
-    train_imgs = os.path.join(data_dir, "train", "images")
-    if os.path.exists(yaml_path) and os.path.isdir(train_imgs):
-        n = len([f for f in os.listdir(train_imgs)
-                 if f.lower().endswith((".jpg", ".jpeg", ".png"))])
-        if n > 0:
-            print(f"Data: already prepared at {data_dir} ({n} training images)")
-            return yaml_path
-
-    # Step 1: Download annotations
-    ann_path = download_taco_annotations(CACHE_DIR)
-
-    # Step 2: Parse annotations
-    with open(ann_path) as f:
-        coco_data = json.load(f)
-    print(f"TACO: {len(coco_data['images'])} images, "
-          f"{len(coco_data['annotations'])} annotations, "
-          f"{len(coco_data['categories'])} categories")
-
-    # Step 3: Download images
-    images_dir = os.path.join(CACHE_DIR, "taco_images")
-    os.makedirs(images_dir, exist_ok=True)
-    download_taco_images(coco_data, images_dir)
-
-    # Step 4: Convert to YOLO format
-    print("Converting to YOLO format...")
-    convert_taco_to_yolo(coco_data, images_dir, data_dir)
-
-    # Step 5: Create data.yaml
-    yaml_path = create_data_yaml(data_dir)
-
-    return yaml_path
-
+    # Sanity check
+    test = "Hello world! Numbers: 123. Unicode: 你好"
+    encoded = enc.encode_ordinary(test)
+    decoded = enc.decode(encoded)
+    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
+    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric for object detection)
+# Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
-def evaluate(model, data_yaml, device=None):
+class Tokenizer:
+    """Minimal tokenizer wrapper. Training is handled above."""
+
+    def __init__(self, enc):
+        self.enc = enc
+        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+
+    @classmethod
+    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
+        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
+            enc = pickle.load(f)
+        return cls(enc)
+
+    def get_vocab_size(self):
+        return self.enc.n_vocab
+
+    def get_bos_token_id(self):
+        return self.bos_token_id
+
+    def encode(self, text, prepend=None, num_threads=8):
+        if prepend is not None:
+            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
+        if isinstance(text, str):
+            ids = self.enc.encode_ordinary(text)
+            if prepend is not None:
+                ids.insert(0, prepend_id)
+        elif isinstance(text, list):
+            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
+            if prepend is not None:
+                for row in ids:
+                    row.insert(0, prepend_id)
+        else:
+            raise ValueError(f"Invalid input type: {type(text)}")
+        return ids
+
+    def decode(self, ids):
+        return self.enc.decode(ids)
+
+
+def get_token_bytes(device="cpu"):
+    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+    with open(path, "rb") as f:
+        return torch.load(f, map_location=device)
+
+
+def _document_batches(split, tokenizer_batch_size=128):
+    """Infinite iterator over document batches from parquet files."""
+    parquet_paths = list_parquet_files()
+    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
+    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
+    if split == "train":
+        parquet_paths = [p for p in parquet_paths if p != val_path]
+        assert len(parquet_paths) > 0, "No training shards found."
+    else:
+        parquet_paths = [val_path]
+    epoch = 1
+    while True:
+        for filepath in parquet_paths:
+            pf = pq.ParquetFile(filepath)
+            for rg_idx in range(pf.num_row_groups):
+                rg = pf.read_row_group(rg_idx)
+                batch = rg.column('text').to_pylist()
+                for i in range(0, len(batch), tokenizer_batch_size):
+                    yield batch[i:i+tokenizer_batch_size], epoch
+        epoch += 1
+
+
+def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     """
-    Evaluate object detection model using ultralytics YOLO val().
-
-    Args:
-        model: ultralytics YOLO model (or path to .pt weights)
-        data_yaml: path to data.yaml
-        device: device string ("cuda", "mps", "cpu", or None for auto)
-
-    Returns dict with:
-        val_mAP50:     mAP at IoU=0.5 (primary metric, higher is better)
-        val_mAP50_95:  mAP at IoU=0.5:0.95
-        val_precision:  overall precision
-        val_recall:     overall recall
-        per_class_mAP50: dict of per-class mAP50
+    BOS-aligned dataloader with best-fit packing.
+    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
+    When no document fits remaining space, crops shortest doc to fill exactly.
+    100% utilization (no padding).
     """
-    from ultralytics import YOLO
+    assert split in ["train", "val"]
+    row_capacity = T + 1
+    batches = _document_batches(split)
+    bos_token = tokenizer.get_bos_token_id()
+    doc_buffer = []
+    epoch = 1
 
-    if isinstance(model, str):
-        model = YOLO(model)
+    def refill_buffer():
+        nonlocal epoch
+        doc_batch, epoch = next(batches)
+        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
+        doc_buffer.extend(token_lists)
 
-    kwargs = {"data": data_yaml, "verbose": False}
-    if device is not None:
-        kwargs["device"] = device
+    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
+    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs = gpu_buffer[:B * T].view(B, T)
+    targets = gpu_buffer[B * T:].view(B, T)
 
-    results = model.val(**kwargs)
+    while True:
+        for row_idx in range(B):
+            pos = 0
+            while pos < row_capacity:
+                while len(doc_buffer) < buffer_size:
+                    refill_buffer()
 
-    metrics = {
-        "val_mAP50": float(results.box.map50),
-        "val_mAP50_95": float(results.box.map),
-        "val_precision": float(results.box.mp),
-        "val_recall": float(results.box.mr),
-    }
+                remaining = row_capacity - pos
 
-    # Per-class mAP50
-    per_class = {}
-    if hasattr(results.box, "ap50") and results.box.ap50 is not None:
-        for i, ap in enumerate(results.box.ap50):
-            if i < NUM_CLASSES:
-                per_class[f"{CLASS_NAMES[i]}({CLASS_NAMES_EN[i]})"] = float(ap)
-    metrics["per_class_mAP50"] = per_class
+                # Find largest doc that fits entirely
+                best_idx = -1
+                best_len = 0
+                for i, doc in enumerate(doc_buffer):
+                    doc_len = len(doc)
+                    if doc_len <= remaining and doc_len > best_len:
+                        best_idx = i
+                        best_len = doc_len
 
-    return metrics
+                if best_idx >= 0:
+                    doc = doc_buffer.pop(best_idx)
+                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
+                    pos += len(doc)
+                else:
+                    # No doc fits — crop shortest to fill remaining
+                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                    doc = doc_buffer.pop(shortest_idx)
+                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    pos += remaining
 
+        cpu_inputs.copy_(row_buffer[:, :-1])
+        cpu_targets.copy_(row_buffer[:, 1:])
+        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        yield inputs, targets, epoch
+
+# ---------------------------------------------------------------------------
+# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate_bpb(model, tokenizer, batch_size):
+    """
+    Bits per byte (BPB): vocab size-independent evaluation metric.
+    Sums per-token cross-entropy (in nats), sums target byte lengths,
+    then converts nats/byte to bits/byte. Special tokens (byte length 0)
+    are excluded from both sums.
+    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    """
+    token_bytes = get_token_bytes(device="cuda")
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    total_nats = 0.0
+    total_bytes = 0
+    for _ in range(steps):
+        x, y, _ = next(val_loader)
+        loss_flat = model(x, y, reduction='none').view(-1)
+        y_flat = y.view(-1)
+        nbytes = token_bytes[y_flat]
+        mask = nbytes > 0
+        total_nats += (loss_flat * mask).sum().item()
+        total_bytes += nbytes.sum().item()
+    return total_nats / (math.log(2) * total_bytes)
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Prepare TACO dataset for garbage object detection"
-    )
-    parser.add_argument("--data-dir", type=str, default=None,
-                        help="Custom data directory (default: ~/.cache/autoresearch/data)")
+    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
+    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
+    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
     args = parser.parse_args()
 
-    data_dir = args.data_dir if args.data_dir else DATA_DIR
+    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
 
     print(f"Cache directory: {CACHE_DIR}")
-    print(f"Data directory:  {data_dir}")
     print()
 
-    # Download and prepare
-    yaml_path = download_and_prepare(data_dir)
+    # Step 1: Download data
+    download_data(num_shards, download_workers=args.download_workers)
     print()
 
-    # Print dataset statistics
-    print("Dataset statistics:")
-    for split in ["train", "val", "test"]:
-        img_dir = os.path.join(data_dir, split, "images")
-        lbl_dir = os.path.join(data_dir, split, "labels")
-        if not os.path.isdir(img_dir):
-            continue
-        n_imgs = len([f for f in os.listdir(img_dir)
-                      if f.lower().endswith((".jpg", ".jpeg", ".png"))])
-        n_lbls = len([f for f in os.listdir(lbl_dir)
-                      if f.endswith(".txt")]) if os.path.isdir(lbl_dir) else 0
-        print(f"  {split:5s}: {n_imgs} images, {n_lbls} label files")
+    # Step 2: Train tokenizer
+    train_tokenizer()
     print()
-
-    print(f"Data config: {yaml_path}")
-    print("Done! Ready to train with: python train.py")
+    print("Done! Ready to train.")
